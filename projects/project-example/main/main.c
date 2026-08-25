@@ -1,6 +1,6 @@
 // main.c
 
-#include rpl_component_example;
+#include "rpl_component_example.h"
 
 // main helper functions
 //
