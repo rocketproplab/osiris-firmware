@@ -1,0 +1,129 @@
+menu "Flight Computer Task Priorities"
+
+comment "Higher number = higher priority. FreeRTOS runs the highest-"
+comment "priority READY task; equal priorities round-robin."
+
+# =====================================================================
+#  Why these live together in ONE file
+#
+#  Task priorities are only meaningful relative to each other. Splitting
+#  them across per-component Kconfig files would let you set two tasks
+#  to the same number, or invert an intended ordering, without ever
+#  seeing both values on screen at once. Keeping them in a single
+#  menuconfig page makes the whole ordering reviewable at a glance.
+#
+#  These are Kconfig.projbuild options, so CONFIG_FC_PRIO_* is visible
+#  to every component, not just main.
+# =====================================================================
+
+config FC_PRIO_DISCRETE
+    int "External discrete input handler tasks"
+    range 1 24
+    default 11
+    help
+        Tasks woken by the Blue Raven discrete GPIO interrupts -- the
+        staging line (J8) and the recovery line (J7). Both tasks share
+        this priority. Each BR output is split two ways: one branch to
+        actuation hardware, one to this board, which only listens.
+
+        NOTE: this is the TASK priority, not the interrupt priority.
+        The ISR itself preempts every task on this list regardless of
+        what any of these numbers say -- see FC_DISCRETE_ISR_LEVEL below
+        if you need to change the interrupt's own level.
+
+        Highest task priority in the system: a staging or recovery
+        event is time-critical and must not wait behind a sensor read.
+
+config FC_PRIO_SENSORS
+    int "Sensor reader tasks (BMP388, LSM6DSOX, GPS)"
+    range 1 24
+    default 9
+    help
+        Shared by all three sensor reader tasks. They sleep on an
+        interrupt notification and do a short SPI/UART read on wake, so
+        they need to run promptly but hold the CPU only briefly.
+
+        All three share one priority deliberately: none is more urgent
+        than the others, and equal priorities round-robin, which spreads
+        CPU fairly when two fire close together.
+
+config FC_PRIO_DEPLOY
+    int "Deployment logic task"
+    range 1 24
+    default 7
+    help
+        Consumes sensor data and decides on deployment events.
+
+        Below the sensors on purpose: it can only act on data the
+        sensors have already produced, so starving a sensor to run this
+        sooner would just make it reason about staler numbers.
+
+config FC_PRIO_TELEMETRY
+    int "Telemetry / XBee task"
+    range 1 24
+    default 5
+    help
+        Transmits downlink frames over the XBee.
+
+        Above the SD writer because telemetry is the backup record: if
+        the card is lost or corrupted, whatever got transmitted is all
+        that survives. A radio frame also has a hard deadline that a
+        disk write does not -- miss the slot and the data is simply
+        gone, whereas a delayed SD write still lands.
+
+config FC_PRIO_SD_WRITER
+    int "SD card writer task"
+    range 1 24
+    default 3
+    help
+        Drains the log queue and writes to the card.
+
+        Lowest of the five despite SD being the primary storage. This
+        is not a statement about importance -- it is about latency
+        tolerance. SD writes stall unpredictably (block erase, wear
+        levelling) for tens of milliseconds, and a stall at a higher
+        priority would block genuinely time-critical work. The queue in
+        front of this task is what makes the low priority safe: samples
+        buffer up rather than being lost while the card is busy.
+
+        If queue_full_drops in sd_logger_diag_t starts climbing, raise
+        SD_LOGGER_QUEUE_DEPTH before raising this priority.
+
+config FC_PRIO_BATTERY
+    int "Battery monitor task"
+    range 1 24
+    default 2
+    help
+        Samples the pack voltage divider on ADC1 and publishes it as
+        its own log stream.
+
+        Below the SD writer because it is the only task on this list
+        whose output nothing else waits on -- a battery sample arriving
+        a few milliseconds late costs nothing, while delaying the writer
+        costs queue headroom for every other stream.
+
+        Above print because it produces flight record and print
+        produces console noise.
+
+endmenu
+
+menu "Flight Computer Interrupt Levels"
+
+config FC_DISCRETE_ISR_LEVEL
+    int "External discrete GPIO interrupt level (1-3)"
+    range 1 3
+    default 1
+    help
+        Hardware interrupt level for the external discrete GPIOs, NOT a
+        task priority -- a different scale entirely.
+
+        Levels 1-3 can be written in C. Levels 4+ require hand-written
+        assembly and cannot call any FreeRTOS API, so this is capped
+        at 3 on purpose.
+
+        Level 1 is correct for almost everything. Raise it only if you
+        measure a discrete edge being serviced too late, and know that
+        doing so lets it preempt other level-1 ISRs including the
+        sensor DRDY handlers.
+
+endmenu
