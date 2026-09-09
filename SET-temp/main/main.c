@@ -4,8 +4,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/spi_master.h"
+#include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_rom_sys.h"
 
 
 #include "bmp388_sensor.h"
@@ -263,6 +265,81 @@ static StackType_t  s_status_stack[STATUS_TASK_STACK_WORDS];
 /* ===================================================================
  *  SPI bus
  * =================================================================== */
+
+/* ===================================================================
+ *  Bench diagnostic -- static probe of the five sensor-bus pads.
+ *
+ *  Set to 0 once the bus is trusted. Runs before spi_bus_initialize()
+ *  and leaves every pad reset, so a normal boot follows it either way.
+ *
+ *  What it does: floats each pad with the internal pull-up (~45k), reads
+ *  it, then with the internal pull-down, reads it again. A pad with
+ *  nothing on it follows the internal pull both times. A pad actually
+ *  connected to the breakouts is loaded by whatever those boards put on
+ *  the net -- Adafruit STEMMA boards carry 10k pull-ups on SCL/SDA, and
+ *  10k beats the internal 45k -- so a *connected* SCLK or MOSI should
+ *  read HIGH even against the internal pull-down.
+ *
+ *  Read the result against SET_AV.kicad_pcb rather than against this
+ *  comment: what matters is that a pad you believe is wired to a powered
+ *  breakout does NOT behave identically to one you know is unconnected.
+ * =================================================================== */
+#define SENSOR_BUS_SELFTEST   1
+
+#if SENSOR_BUS_SELFTEST
+static void sensor_bus_probe_pin(const char *name, gpio_num_t pin)
+{
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << pin,
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    if (gpio_config(&io) != ESP_OK) {
+        ESP_LOGE(TAG, "  %-5s GPIO%-2d  CANNOT BE CONFIGURED AS GPIO",
+                 name, (int)pin);
+        return;
+    }
+    esp_rom_delay_us(5000);
+    const int with_pu = gpio_get_level(pin);
+
+    io.pull_up_en   = GPIO_PULLUP_DISABLE;
+    io.pull_down_en = GPIO_PULLDOWN_ENABLE;
+    gpio_config(&io);
+    esp_rom_delay_us(5000);
+    const int with_pd = gpio_get_level(pin);
+
+    const char *verdict;
+    if (with_pu == 1 && with_pd == 0) {
+        verdict = "floats with the internal pull -- no external load seen";
+    } else if (with_pu == 1 && with_pd == 1) {
+        verdict = "held HIGH externally (external pull-up wins)";
+    } else if (with_pu == 0 && with_pd == 0) {
+        verdict = "held LOW externally (external pull-down, or short to GND)";
+    } else {
+        verdict = "unstable -- reads inverted, do not trust this pad";
+    }
+    ESP_LOGW(TAG, "  %-5s GPIO%-2d  pu=%d pd=%d  %s",
+             name, (int)pin, with_pu, with_pd, verdict);
+
+    /* Back to a clean default. gpio_reset_pin() also runs
+     * rtc_gpio_deinit(), which matters for the pads below GPIO16: those
+     * are LP_IO on the P4, and the SPI driver never deinits them itself. */
+    gpio_reset_pin(pin);
+}
+
+static void sensor_bus_selftest(void)
+{
+    ESP_LOGW(TAG, "=== sensor bus pad probe (SENSOR_BUS_SELFTEST=1) ===");
+    sensor_bus_probe_pin("SCLK", PIN_SCLK);
+    sensor_bus_probe_pin("MOSI", PIN_MOSI);
+    sensor_bus_probe_pin("MISO", PIN_MISO);
+    sensor_bus_probe_pin("CS_B", PIN_CS_BMP388);
+    sensor_bus_probe_pin("CS_L", PIN_CS_LSM6DSOX);
+    ESP_LOGW(TAG, "=== end pad probe ===");
+}
+#endif /* SENSOR_BUS_SELFTEST */
 
 static esp_err_t sensor_bus_init(void)
 {
@@ -941,6 +1018,10 @@ void app_main(void)
             return;
         }
     }
+
+#if SENSOR_BUS_SELFTEST
+    sensor_bus_selftest();
+#endif
 
     if (sensor_bus_init() != ESP_OK) {
         return;

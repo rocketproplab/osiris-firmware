@@ -537,6 +537,15 @@ esp_err_t lsm6dsox_init(const lsm6dsox_config_t *cfg, lsm6dsox_handle_t *out)
 
     dev->cfg = *cfg;   /* shallow copy -- cfg can die after this call returns */
 
+    /* Hand the CS pad back to the HP digital path before the SPI driver
+     * takes it. On the ESP32-P4, GPIO0-15 are LP_IO pads (SOC_RTCIO_PIN_COUNT
+     * is 16) and spicommon_cs_initialize() -- unlike gpio_config() -- never
+     * calls rtc_gpio_deinit(). A CS assigned down there can end up never
+     * driven, which leaves the part sitting in I2C mode: it answers nothing
+     * on SPI and its SDO stays a high-Z address-select input. Costs nothing
+     * on a pad that was already digital. */
+    gpio_reset_pin(cfg->cs_pin);
+
     /* Mode 3 (CPOL=1, CPHA=1) is what the LSM6DSOX datasheet specifies.
      * Mode 0 also worked in practice -- both modes sample on the rising
      * edge and shift on the falling one, so they differ only in the idle

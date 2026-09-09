@@ -395,6 +395,15 @@ esp_err_t bmp388_init(const bmp388_config_t *cfg, bmp388_handle_t *out)
         dev->cfg.ref_pressure_pa = 101325.0f;
     }
 
+    /* Hand the CS pad back to the HP digital path before the SPI driver
+     * takes it. On the ESP32-P4, GPIO0-15 are LP_IO pads (SOC_RTCIO_PIN_COUNT
+     * is 16) and spicommon_cs_initialize() -- unlike gpio_config() -- never
+     * calls rtc_gpio_deinit(). A CS assigned down there can end up never
+     * driven, which leaves the part sitting in I2C mode: it answers nothing
+     * on SPI and its SDO stays a high-Z address-select input. Costs nothing
+     * on a pad that was already digital. */
+    gpio_reset_pin(cfg->cs_pin);
+
     spi_device_interface_config_t devcfg = {
         .mode           = 0,
         .clock_speed_hz = cfg->spi_freq_hz,
