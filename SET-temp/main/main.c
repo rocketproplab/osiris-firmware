@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdbool.h>
+#include <string.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -341,146 +342,106 @@ static void sensor_bus_selftest(void)
 }
 
 /* ===================================================================
- *  MISO pin finder.
+ *  Bus exerciser -- makes the bus visible to a multimeter.
  *
- *  Only worth running when the pad probe says MISO floats while SCLK,
- *  MOSI and both CS lines show the breakouts' pull-ups: that means three
- *  of the four signals reach the sensors and only the data-return line
- *  does not.
+ *  A normal boot puts perhaps 300 us of traffic on this bus, once, and
+ *  then app_main() returns and the bus is idle forever. Averaged over a
+ *  meter's integration time that is indistinguishable from no traffic at
+ *  all, so DC readings taken during a normal run tell you about the IDLE
+ *  state and nothing else. This loops transactions continuously so the
+ *  averages actually mean something.
  *
- *  Walks every GPIO this board is not already using, brings the bus up
- *  with that pad as MISO, and asks both parts for their ID. Reading is
- *  all it does -- for an SPI master MISO is input-only, so a candidate
- *  pad is never driven and a wrong guess cannot fight anything that owns
- *  that pin. Each candidate also gets an internal pull-DOWN, so a pad
- *  with nothing on it reads a clean 0x00 instead of the partial value a
- *  weak pull-up gives while it charges a floating line.
+ *  Deliberately mode 0, so SCLK idles LOW: under this load any reading
+ *  meaningfully above 0 V proves the clock is leaving the pin. That is
+ *  the one thing a meter cannot tell you at idle, because a stopped
+ *  mode-3 clock and a clock that never arrives at all both sit at 3.3 V
+ *  behind the breakouts' pull-ups.
  *
- *  A hit is LSM6DSOX WHO_AM_I = 0x6C or BMP388 chip ID = 0x50 / 0x60.
+ *  Expect, with ~95% duty:
+ *    SCLK  ~1.5 V   (square wave, half rail; 0 V means no clock)
+ *    MOSI  ~1.5 V   (0xAA pattern is half ones)
+ *    CS    ~1.9 V   (each of the two low about 45% of the time)
+ *    MISO  ~0 V     unless a sensor answers -- it is pulled down here
  * =================================================================== */
-#define SENSOR_BUS_MISO_SCAN  1
+#define SENSOR_BUS_EXERCISER  1
 
-#if SENSOR_BUS_MISO_SCAN
-
-#define SCAN_SPI_HZ  (1 * 1000 * 1000)   /* slow: this is a probe, not a rate test */
-
-/* Pads this board has already committed to something. */
-static bool sensor_bus_pin_in_use(int pin)
-{
-    static const int used[] = {
-        PIN_SCLK, PIN_MOSI, PIN_CS_BMP388, PIN_CS_LSM6DSOX,
-        PIN_INT_BMP388, PIN_INT_LSM6DSOX, PIN_INT2_LSM6DSOX,
-        PIN_TX_GPS, PIN_RX_GPS, PIN_PPS_GPS, PIN_EN_GPS,
-        PIN_TX_XBEE, PIN_RX_XBEE, PIN_RST_XBEE, PIN_CTS_XBEE,
-        PIN_STAGING_IN, PIN_RECOVERY_IN, PIN_VBAT_SENSE,
-        39, 40, 41, 42, 43, 44,        /* SDMMC 4-bit slot -- see sd_logger.c */
-    };
-    for (size_t i = 0; i < sizeof(used) / sizeof(used[0]); i++) {
-        if (used[i] == pin) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/* One raw register read. reg already carries the read bit; dummy is the
- * number of throwaway bytes the part sends before its data (1 on the
- * BMP3xx, 0 on the LSM6DSOX). */
-static uint8_t sensor_bus_probe_id(spi_device_handle_t spi, uint8_t reg, int dummy)
-{
-    uint8_t tx[4] = { reg, 0, 0, 0 };
-    uint8_t rx[4] = { 0 };
-    spi_transaction_t t = {
-        .length    = (size_t)(2 + dummy) * 8,
-        .rxlength  = (size_t)(2 + dummy) * 8,
-        .tx_buffer = tx,
-        .rx_buffer = rx,
-    };
-    if (spi_device_polling_transmit(spi, &t) != ESP_OK) {
-        return 0x00;
-    }
-    return rx[1 + dummy];
-}
-
-static bool sensor_bus_try_miso(int cand, uint8_t *lsm_who, uint8_t *bmp_id)
+#if SENSOR_BUS_EXERCISER
+static void sensor_bus_exerciser(void)
 {
     spi_bus_config_t bus = {
         .mosi_io_num     = PIN_MOSI,
-        .miso_io_num     = cand,
+        .miso_io_num     = PIN_MISO,
         .sclk_io_num     = PIN_SCLK,
         .quadwp_io_num   = -1,
         .quadhd_io_num   = -1,
         .max_transfer_sz = 64,
     };
     if (spi_bus_initialize(SENSOR_SPI_HOST, &bus, SPI_DMA_CH_AUTO) != ESP_OK) {
-        return false;
+        ESP_LOGE(TAG, "exerciser: spi_bus_initialize failed");
+        return;
     }
-    /* After the bus is up: the SPI driver sets no pull of its own, and
-     * gpio_set_pull_mode() leaves the matrix routing alone. */
-    gpio_set_pull_mode((gpio_num_t)cand, GPIO_PULLDOWN_ONLY);
+    gpio_set_pull_mode(PIN_MISO, GPIO_PULLDOWN_ONLY);
 
-    *lsm_who = 0x00;
-    *bmp_id  = 0x00;
-
-    spi_device_interface_config_t lsm = {
-        .mode = 3, .clock_speed_hz = SCAN_SPI_HZ,
-        .spics_io_num = PIN_CS_LSM6DSOX, .queue_size = 1,
-    };
-    spi_device_handle_t h = NULL;
-    if (spi_bus_add_device(SENSOR_SPI_HOST, &lsm, &h) == ESP_OK) {
-        *lsm_who = sensor_bus_probe_id(h, 0x0F | 0x80, 0);   /* WHO_AM_I */
-        spi_bus_remove_device(h);
-    }
-
-    spi_device_interface_config_t bmp = {
-        .mode = 0, .clock_speed_hz = SCAN_SPI_HZ,
-        .spics_io_num = PIN_CS_BMP388, .queue_size = 1,
-    };
-    h = NULL;
-    if (spi_bus_add_device(SENSOR_SPI_HOST, &bmp, &h) == ESP_OK) {
-        *bmp_id = sensor_bus_probe_id(h, 0x00 | 0x80, 1);    /* CHIP_ID + dummy */
-        spi_bus_remove_device(h);
+    spi_device_handle_t dev[2] = { NULL, NULL };
+    const gpio_num_t cs[2] = { PIN_CS_BMP388, PIN_CS_LSM6DSOX };
+    for (int i = 0; i < 2; i++) {
+        spi_device_interface_config_t c = {
+            .mode           = 0,               /* SCLK idles LOW -- see above */
+            .clock_speed_hz = 1000000,
+            .spics_io_num   = cs[i],
+            .queue_size     = 1,
+        };
+        if (spi_bus_add_device(SENSOR_SPI_HOST, &c, &dev[i]) != ESP_OK) {
+            ESP_LOGE(TAG, "exerciser: could not add device on CS GPIO%d", (int)cs[i]);
+            return;
+        }
     }
 
-    spi_bus_free(SENSOR_SPI_HOST);
-    gpio_reset_pin((gpio_num_t)cand);
-    return true;
+    ESP_LOGW(TAG, "=== BUS EXERCISER RUNNING (SENSOR_BUS_EXERCISER=1) ===");
+    ESP_LOGW(TAG, "continuous traffic, mode 0, 1 MHz. Measure now. Expect roughly:");
+    ESP_LOGW(TAG, "  SCLK GPIO%-2d ~1.5 V   <-- 3.3 V or 0 V here means NO CLOCK",
+             (int)PIN_SCLK);
+    ESP_LOGW(TAG, "  MOSI GPIO%-2d ~1.5 V", (int)PIN_MOSI);
+    ESP_LOGW(TAG, "  CS   GPIO%d/%d ~1.9 V", (int)cs[0], (int)cs[1]);
+    ESP_LOGW(TAG, "  MISO GPIO%-2d ~0 V unless a sensor is answering", (int)PIN_MISO);
+
+    uint8_t tx[16], rx[16];
+    memset(tx, 0xAA, sizeof(tx));
+    uint32_t bursts = 0;
+    int which = 0;
+
+    for (;;) {
+        /* ~200 ms of back-to-back traffic, then yield. The yield is not
+         * optional: a tight loop at this priority starves the idle task
+         * on this core and the task watchdog fires. */
+        const int64_t until = esp_timer_get_time() + 200000;
+        uint8_t seen = 0x00;
+
+        while (esp_timer_get_time() < until) {
+            memset(rx, 0, sizeof(rx));
+            spi_transaction_t t = {
+                .length    = sizeof(tx) * 8,
+                .rxlength  = sizeof(rx) * 8,
+                .tx_buffer = tx,
+                .rx_buffer = rx,
+            };
+            if (spi_device_polling_transmit(dev[which], &t) == ESP_OK) {
+                for (size_t i = 0; i < sizeof(rx); i++) {
+                    seen |= rx[i];
+                }
+            }
+            which ^= 1;
+        }
+
+        if ((bursts++ % 10) == 0) {
+            ESP_LOGW(TAG, "  exercising... MISO %s",
+                     seen ? "SAW NON-ZERO BYTES -- something is driving it"
+                          : "read all zeroes (nothing driving MISO)");
+        }
+        vTaskDelay(1);
+    }
 }
-
-static void sensor_bus_miso_scan(void)
-{
-    int hits = 0;
-
-    ESP_LOGW(TAG, "=== MISO pin scan: looking for LSM 0x6C / BMP 0x50 or 0x60 ===");
-    for (int cand = 0; cand < 55; cand++) {
-        if (!GPIO_IS_VALID_GPIO(cand) || sensor_bus_pin_in_use(cand)) {
-            continue;
-        }
-
-        uint8_t who = 0, id = 0;
-        if (!sensor_bus_try_miso(cand, &who, &id)) {
-            continue;
-        }
-
-        const bool hit = (who == 0x6C) || (id == 0x50) || (id == 0x60);
-        if (hit) {
-            hits++;
-            ESP_LOGE(TAG, "  >>> GPIO%-2d  LSM=0x%02X  BMP=0x%02X   <<< MISO IS HERE",
-                     cand, who, id);
-        } else if (who != 0x00 || id != 0x00) {
-            ESP_LOGW(TAG, "      GPIO%-2d  LSM=0x%02X  BMP=0x%02X   (noise, not an ID)",
-                     cand, who, id);
-        }
-    }
-
-    if (hits == 0) {
-        ESP_LOGE(TAG, "  no pad on this chip returns a valid ID.");
-        ESP_LOGE(TAG, "  MISO is not merely on the wrong GPIO -- the sensors' "
-                      "SDO/DO pins are not reaching the ESP32 at all.");
-    }
-    ESP_LOGW(TAG, "=== end MISO scan ===");
-}
-#endif /* SENSOR_BUS_MISO_SCAN */
+#endif /* SENSOR_BUS_EXERCISER */
 #endif /* SENSOR_BUS_SELFTEST */
 
 static esp_err_t sensor_bus_init(void)
@@ -1173,8 +1134,8 @@ void app_main(void)
 
 #if SENSOR_BUS_SELFTEST
     sensor_bus_selftest();
-#if SENSOR_BUS_MISO_SCAN
-    sensor_bus_miso_scan();
+#if SENSOR_BUS_EXERCISER
+    sensor_bus_exerciser();   /* never returns */
 #endif
 #endif
 
