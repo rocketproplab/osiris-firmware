@@ -946,29 +946,38 @@ void app_main(void)
         return;
     }
 
-    if((baro_start(&s_sensors.baro) != ESP_OK) || (imu_start(&s_sensors.imu) != ESP_OK) || (gps_start_sensor(&s_sensors.gps) != ESP_OK)) {
-        ESP_LOGE(TAG, "One or more sensors failed to start");
-        //event_log_error(ERR_SRC_SENSORS, ERR_CODE_INIT_FAILED, ESP_FAIL, 0);
-        if (baro_start(&s_sensors.baro) != ESP_OK) {
-            ESP_LOGE(TAG, "barometer failed to start");
-            event_log_error(ERR_SRC_BMP388, ERR_CODE_INIT_FAILED, ESP_FAIL, 0);
-        }
-
-        if (gps_start_sensor(&s_sensors.gps) != ESP_OK) {
-            ESP_LOGE(TAG, "GPS failed to start");
-            event_log_error(ERR_SRC_GPS, ERR_CODE_INIT_FAILED, ESP_FAIL, 0);
-        }
-
-        if (imu_start(&s_sensors.imu) != ESP_OK) {
-            ESP_LOGE(TAG, "IMU failed to start");
-            event_log_error(ERR_SRC_LSM6DSOX, ERR_CODE_INIT_FAILED, ESP_FAIL, 0);
-        }
-        return;
-
+    /* Each sensor is started exactly ONCE and its own result kept.
+     *
+     * The previous shape short-circuited a || chain and then re-called
+     * every start function to work out which one had failed. Both
+     * mistakes: the chain never reached the later sensors, and a second
+     * call to a start function that had already succeeded came back
+     * ESP_ERR_NO_MEM off the *_MAX_INSTANCES == 1 pool -- so a single
+     * genuine failure was reported as two or three, naming sensors that
+     * were working. Diagnose from these messages only now that they
+     * cannot lie. */
+    esp_err_t baro_err = baro_start(&s_sensors.baro);
+    if (baro_err != ESP_OK) {
+        ESP_LOGE(TAG, "barometer failed to start: %s", esp_err_to_name(baro_err));
+        event_log_error(ERR_SRC_BMP388, ERR_CODE_INIT_FAILED, baro_err, 0);
     }
-    /*
-    
-*/
+
+    esp_err_t imu_err = imu_start(&s_sensors.imu);
+    if (imu_err != ESP_OK) {
+        ESP_LOGE(TAG, "IMU failed to start: %s", esp_err_to_name(imu_err));
+        event_log_error(ERR_SRC_LSM6DSOX, ERR_CODE_INIT_FAILED, imu_err, 0);
+    }
+
+    esp_err_t gps_err = gps_start_sensor(&s_sensors.gps);
+    if (gps_err != ESP_OK) {
+        ESP_LOGE(TAG, "GPS failed to start: %s", esp_err_to_name(gps_err));
+        event_log_error(ERR_SRC_GPS, ERR_CODE_INIT_FAILED, gps_err, 0);
+    }
+
+    if (baro_err != ESP_OK || imu_err != ESP_OK || gps_err != ESP_OK) {
+        ESP_LOGE(TAG, "one or more sensors failed to start -- refusing to continue");
+        return;
+    }
     /* SD and telemetry are each started independently and neither
      * failure is fatal -- losing one destination shouldn't cost you the
      * other. Each failure sets its handle to NULL; data_router_init()

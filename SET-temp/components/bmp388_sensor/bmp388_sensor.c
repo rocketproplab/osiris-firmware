@@ -462,8 +462,11 @@ esp_err_t bmp388_start(bmp388_handle_t dev, UBaseType_t priority, BaseType_t cor
         return ESP_FAIL;
     }
 
-    struct bmp3_status status;
-    (void)bmp3_get_status(&status, &dev->bmp);
+    /* No SPI traffic from here on. bmp388_task is already running at this
+     * point and it owns dev->spi; a second task driving the same
+     * spi_device_handle_t through spi_device_polling_transmit() is
+     * explicitly unsupported. The bmp3_get_status() call that used to
+     * live here did exactly that, and threw its result away. */
 
     return ESP_OK;
 }
@@ -510,7 +513,15 @@ esp_err_t bmp388_wait_for_sample(bmp388_handle_t dev, uint32_t last_seq,
     }
 
     const TickType_t start = xTaskGetTickCount();
-    const TickType_t poll  = pdMS_TO_TICKS(1);
+    /* CONFIG_FREERTOS_HZ is 100, so a 1 ms request truncates to 0 ticks
+     * and vTaskDelay(0) is a yield rather than a sleep -- this loop would
+     * spin at the caller's priority for the whole timeout. Clamp to the
+     * shortest real sleep the scheduler can give, the same way
+     * bmp388_delay_us() does. */
+    TickType_t poll = pdMS_TO_TICKS(1);
+    if (poll == 0) {
+        poll = 1;
+    }
 
     for (;;) {
         bmp388_get_latest(dev, out);

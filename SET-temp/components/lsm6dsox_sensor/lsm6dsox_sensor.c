@@ -65,12 +65,18 @@ static const char *TAG = "LSM6DSOX";
  * FS_XL/64; at +/-16 g that is 0.25 g per count. */
 #define WAKE_THS_LSB_G          (16.0f / 64.0f)
 
-/* SPI framing bits, ST convention:
- *   bit7 = R/W  (1 = read, 0 = write)
- *   bit6 = MS   (auto-increment; must be set for any transfer >1 byte)
+/* SPI framing, LSM6DSOX convention:
+ *   bit7   = R/W  (1 = read, 0 = write)
+ *   bit6:0 = register address -- all seven bits
+ *
+ * There is NO MS/auto-increment bit on this part. That bit exists on the
+ * older ST parts (LIS3DH, L3GD20) and setting it here would land bit 6
+ * inside the address: a 6-byte read of OUTX_L_G (0x22) would go to 0x62
+ * instead. Multi-byte transfers auto-increment because IF_INC in CTRL3_C
+ * is set, which is the reset default and is preserved below.
+ *
  * No dummy byte here -- that was BMP388-specific. */
 #define LSM6DSOX_SPI_READ_BIT   0x80
-#define LSM6DSOX_SPI_MS_BIT     0x40
 
 /* ===================================================================
  *  The real struct -- private to this file, same idiom as bmp388_dev.
@@ -125,9 +131,6 @@ static esp_err_t lsm6dsox_read_regs(lsm6dsox_handle_t dev, uint8_t reg,
     }
 
     uint8_t addr = reg | LSM6DSOX_SPI_READ_BIT;
-    if (len > 1) {
-        addr |= LSM6DSOX_SPI_MS_BIT;
-    }
 
     uint8_t tx[33] = {0};
     uint8_t rx[33] = {0};
@@ -386,9 +389,18 @@ static esp_err_t lsm6dsox_configure_sensor(lsm6dsox_handle_t dev)
 
     lsm6dsox_write_reg(dev, LSM6DSOX_CTRL3_C, 0x01);
 
+    /* pdMS_TO_TICKS(1) is 0 at CONFIG_FREERTOS_HZ=100, which made this a
+     * yield-only loop -- it happened to work because 100 SPI reads take
+     * far longer than the ~50 us the reset needs, but it was not the
+     * bounded wait it looks like. */
+    TickType_t reset_poll = pdMS_TO_TICKS(1);
+    if (reset_poll == 0) {
+        reset_poll = 1;
+    }
+
     uint8_t ctrl3 = 0x01;
     for (int i = 0; i < 100 && (ctrl3 & 0x01); i++) {
-        vTaskDelay(pdMS_TO_TICKS(1));
+        vTaskDelay(reset_poll);
         lsm6dsox_read_regs(dev, LSM6DSOX_CTRL3_C, &ctrl3, 1);
     }
     if (ctrl3 & 0x01) {
@@ -400,9 +412,13 @@ static esp_err_t lsm6dsox_configure_sensor(lsm6dsox_handle_t dev)
     lsm6dsox_read_regs(dev, LSM6DSOX_CTRL3_C, &ctrl3, 1);
     lsm6dsox_write_reg(dev, LSM6DSOX_CTRL3_C, ctrl3 | 0x40);
 
+    /* CTRL9_XL bit 1 is I3C_disable; bit 0 is reserved. Writing 0x01 set
+     * the reserved bit and left the I3C block enabled -- with SPI wired
+     * up, an I3C reset pattern on the shared pins can then knock the
+     * digital interface over mid-flight. */
     uint8_t ctrl9 = 0;
     lsm6dsox_read_regs(dev, LSM6DSOX_CTRL9_XL, &ctrl9, 1);
-    lsm6dsox_write_reg(dev, LSM6DSOX_CTRL9_XL, ctrl9 | 0x01);
+    lsm6dsox_write_reg(dev, LSM6DSOX_CTRL9_XL, ctrl9 | 0x02);
 
     err = lsm6dsox_write_reg(dev, LSM6DSOX_CTRL1_XL, LSM6DSOX_CTRL1_XL_VAL);
     if (err != ESP_OK) { ESP_LOGE(TAG, "CTRL1_XL write failed"); return err; }
@@ -521,8 +537,15 @@ esp_err_t lsm6dsox_init(const lsm6dsox_config_t *cfg, lsm6dsox_handle_t *out)
 
     dev->cfg = *cfg;   /* shallow copy -- cfg can die after this call returns */
 
+    /* Mode 3 (CPOL=1, CPHA=1) is what the LSM6DSOX datasheet specifies.
+     * Mode 0 also worked in practice -- both modes sample on the rising
+     * edge and shift on the falling one, so they differ only in the idle
+     * level of SCLK between transactions -- but there is no reason to
+     * run off-datasheet. The BMP388 stays on mode 0 (it accepts 0 or 3);
+     * the driver reprograms the mode per device, so the two sharing this
+     * bus is fine. */
     spi_device_interface_config_t devcfg = {
-        .mode           = 0,
+        .mode           = 3,
         .clock_speed_hz = cfg->spi_freq_hz,
         .spics_io_num   = cfg->cs_pin,
         .queue_size     = 1,
@@ -623,7 +646,12 @@ esp_err_t lsm6dsox_wait_for_sample(lsm6dsox_handle_t dev, uint32_t last_seq,
     }
 
     const TickType_t start = xTaskGetTickCount();
-    const TickType_t poll  = pdMS_TO_TICKS(1);
+    /* See bmp388_wait_for_sample(): at 100 Hz tick, pdMS_TO_TICKS(1) is
+     * 0 and vTaskDelay(0) only yields, turning this into a busy-spin. */
+    TickType_t poll = pdMS_TO_TICKS(1);
+    if (poll == 0) {
+        poll = 1;
+    }
 
     for (;;) {
         lsm6dsox_get_latest(dev, out);

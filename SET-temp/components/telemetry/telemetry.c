@@ -524,10 +524,23 @@ static void xbee_hard_reset(struct telemetry_dev *dev)
         return;
     }
 
+    /* Both of these truncate to 0 ticks at CONFIG_FREERTOS_HZ=100, which
+     * made the "pulse" a pair of back-to-back register writes microseconds
+     * apart -- /RESET was never actually held. Clamp to one tick (10 ms
+     * here), comfortably above the module's minimum. */
+    TickType_t settle = pdMS_TO_TICKS(2);
+    if (settle == 0) {
+        settle = 1;
+    }
+    TickType_t pulse = pdMS_TO_TICKS(XBEE_RESET_PULSE_MS);
+    if (pulse == 0) {
+        pulse = 1;
+    }
+
     gpio_set_level(dev->cfg.rst_pin, 1);          /* released */
-    vTaskDelay(pdMS_TO_TICKS(2));
+    vTaskDelay(settle);
     gpio_set_level(dev->cfg.rst_pin, 0);          /* asserted */
-    vTaskDelay(pdMS_TO_TICKS(XBEE_RESET_PULSE_MS));
+    vTaskDelay(pulse);
     gpio_set_level(dev->cfg.rst_pin, 1);          /* released */
 
     dev->diag.bringup_resets++;
