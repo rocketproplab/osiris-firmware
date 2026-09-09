@@ -1093,6 +1093,10 @@ static void status_task(void *arg)
 void app_main(void)
 {
     ESP_LOGI(TAG, "ESP32-P4 flight sensors, interrupt driven");
+    /* Build stamp. Printed first so a log can always be matched to the
+     * image that produced it -- flashing a stale binary looks exactly
+     * like a change that did not work. */
+    ESP_LOGW(TAG, "build " __DATE__ " " __TIME__);
 
     /* Armed before anything else starts. PRIO_DISCRETE outranks every
      * other task in this project on purpose -- see the _Static_assert
