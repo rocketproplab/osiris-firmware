@@ -8,6 +8,7 @@
 
 #include "ai_lsm6dsox_reg.h"
 #include "driver/gpio.h"
+#include "driver/i2c_master.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
 
@@ -127,10 +128,11 @@ static void probe_output_pin(const char *name, int gpio) {
 	release_pin(gpio);
 }
 
-// Hold CS low by hand and watch SDO. In I2C mode the pad is an input sitting
-// on the breakout's address pull-down; once the part enters SPI mode it takes
-// the pad over as an output, so the signature should stop looking like a
-// pull-down. If nothing changes, CS is not reaching the chip.
+// Hold CS low by hand and watch SDO. A change proves the part noticed CS and
+// took the pad over. No change proves nothing: the LSM6DSOX, like most SPI
+// slaves, keeps SDO high-impedance until a command byte has clocked in, so an
+// unchanged reading is the normal result when the bus is otherwise idle.
+// Section 1's CS reading is the reliable check that CS is wired.
 static void probe_cs_wakes_sdo(int cs_gpio, int miso_gpio) {
 	wire_state_t idle = classify_wire(miso_gpio);
 
@@ -153,11 +155,121 @@ static void probe_cs_wakes_sdo(int cs_gpio, int miso_gpio) {
 	ESP_LOGI(TAG, "  SDO with CS high: %s", idle == WIRE_PULLED_DOWN ? "pulled LOW (I2C mode, as expected)"
 	                                       : idle == WIRE_FLOATING ? "floating" : "other");
 	if (selected == idle) {
-		ESP_LOGE(TAG, "  SDO with CS low : UNCHANGED - the part is not entering SPI mode."
-		              " CS is not reaching the chip, or the chip is not alive.");
+		ESP_LOGI(TAG, "  SDO with CS low : unchanged - inconclusive, SDO stays hi-Z until a"
+		              " command byte arrives. Trust the CS reading in section 1 instead.");
 	} else {
-		ESP_LOGI(TAG, "  SDO with CS low : CHANGED - the part does respond to CS");
+		ESP_LOGI(TAG, "  SDO with CS low : CHANGED - the part definitely responds to CS");
 	}
+}
+
+
+// Drive the MISO net and see whether it follows. The signature test cannot
+// tell a pull-down resistor from a solder bridge to ground, and a shorted SDO
+// pad would hold every read at 0x00 no matter what else is correct.
+static void probe_miso_short(int gpio) {
+	const gpio_config_t config = {
+		.pin_bit_mask = 1ULL << gpio,
+		.mode = GPIO_MODE_INPUT_OUTPUT,
+		.pull_up_en = GPIO_PULLUP_DISABLE,
+		.pull_down_en = GPIO_PULLDOWN_DISABLE,
+		.intr_type = GPIO_INTR_DISABLE,
+	};
+	gpio_config(&config);
+
+	gpio_set_level(gpio, 1);
+	esp_rom_delay_us(SETTLE_US);
+	int high = gpio_get_level(gpio);
+	gpio_set_level(gpio, 0);
+	release_pin(gpio);
+
+	if (high == 1) {
+		ESP_LOGI(TAG, "  MISO GPIO%-2d  can be driven high: the pull-down is a resistor, not a short",
+		         gpio);
+	} else {
+		ESP_LOGE(TAG, "  MISO GPIO%-2d  SHORTED TO GROUND - cannot be driven high."
+		              " SDO can never read anything but 0x00.", gpio);
+	}
+}
+
+// Talk to the part over I2C on the same wires. With CS high the LSM6DSOX is an
+// I2C device at 0x6A (0x6B if SA0 is high), so a reply here proves the chip is
+// alive and that SCL/SDA carry real data - which would pin the fault firmly on
+// SPI mode entry rather than on the sensor or the wiring.
+static void probe_i2c(int scl_gpio, int sda_gpio, int miso_gpio, int cs_gpio) {
+	// CS high selects I2C; SDO must float so the breakout's resistor sets the
+	// address bit.
+	release_pin(miso_gpio);
+	const gpio_config_t cs_config = {
+		.pin_bit_mask = 1ULL << cs_gpio,
+		.mode = GPIO_MODE_OUTPUT,
+		.pull_up_en = GPIO_PULLUP_DISABLE,
+		.pull_down_en = GPIO_PULLDOWN_DISABLE,
+		.intr_type = GPIO_INTR_DISABLE,
+	};
+	gpio_config(&cs_config);
+	gpio_set_level(cs_gpio, 1);
+
+	const i2c_master_bus_config_t bus_config = {
+		.i2c_port = -1,
+		.sda_io_num = sda_gpio,
+		.scl_io_num = scl_gpio,
+		.clk_source = I2C_CLK_SRC_DEFAULT,
+		.glitch_ignore_cnt = 7,
+		.flags.enable_internal_pullup = true,
+	};
+	i2c_master_bus_handle_t bus = NULL;
+	esp_err_t err = i2c_new_master_bus(&bus_config, &bus);
+	if (err != ESP_OK) {
+		ESP_LOGE(TAG, "  cannot open I2C on these pins: %s", esp_err_to_name(err));
+		release_pin(cs_gpio);
+		return;
+	}
+
+	int found = 0;
+	for (uint16_t address = 0x08; address < 0x78; address++) {
+		if (i2c_master_probe(bus, address, 50) == ESP_OK) {
+			ESP_LOGI(TAG, "  device responding at 0x%02X", address);
+			found++;
+		}
+	}
+	if (found == 0) {
+		ESP_LOGE(TAG, "  nothing on the I2C bus at all - the chip is not responding on"
+		              " either interface, so suspect the part or its supply, not SPI");
+	}
+
+	static const uint16_t CANDIDATES[] = {0x6A, 0x6B};
+	for (size_t i = 0; i < sizeof(CANDIDATES) / sizeof(CANDIDATES[0]); i++) {
+		const i2c_device_config_t device_config = {
+			.dev_addr_length = I2C_ADDR_BIT_LEN_7,
+			.device_address = CANDIDATES[i],
+			.scl_speed_hz = 100000,
+		};
+		i2c_master_dev_handle_t device = NULL;
+		if (i2c_master_bus_add_device(bus, &device_config, &device) != ESP_OK) {
+			continue;
+		}
+
+		const uint8_t reg = AI_LSM6DSOX_REG_WHO_AM_I;
+		uint8_t value = 0;
+		err = i2c_master_transmit_receive(device, &reg, 1, &value, 1, 100);
+		if (err == ESP_OK) {
+			if (value == AI_LSM6DSOX_WHO_AM_I_VALUE) {
+				ESP_LOGI(TAG, "  0x%02X WHO_AM_I = 0x%02X  <-- CHIP IS ALIVE."
+				              " The fault is SPI mode entry, not the sensor.",
+				         CANDIDATES[i], value);
+			} else {
+				ESP_LOGW(TAG, "  0x%02X WHO_AM_I = 0x%02X (not an LSM6DSOX)", CANDIDATES[i], value);
+			}
+		} else {
+			ESP_LOGI(TAG, "  0x%02X no reply (%s)", CANDIDATES[i], esp_err_to_name(err));
+		}
+		i2c_master_bus_rm_device(device);
+	}
+
+	i2c_del_master_bus(bus);
+	release_pin(cs_gpio);
+	release_pin(scl_gpio);
+	release_pin(sda_gpio);
 }
 
 static void probe_mode(spi_host_device_t host,
@@ -222,8 +334,13 @@ void spi_probe_run(const ai_spi_bus_config_t *bus_config,
 	probe_output_pin("SCLK", bus_config->sclk_gpio);
 	probe_output_pin("MOSI", bus_config->mosi_gpio);
 	probe_output_pin("CS", device_config->cs_gpio);
+	probe_miso_short(bus_config->miso_gpio);
 
-	ESP_LOGI(TAG, "4. WHO_AM_I in each SPI mode (expecting 0x%02X)", AI_LSM6DSOX_WHO_AM_I_VALUE);
+	ESP_LOGI(TAG, "4. Is the chip alive on I2C? (same wires, CS held high)");
+	probe_i2c(bus_config->sclk_gpio, bus_config->mosi_gpio,
+	          bus_config->miso_gpio, device_config->cs_gpio);
+
+	ESP_LOGI(TAG, "5. WHO_AM_I in each SPI mode (expecting 0x%02X)", AI_LSM6DSOX_WHO_AM_I_VALUE);
 	esp_err_t err = ai_spi_bus_init(bus_config);
 	if (err != ESP_OK) {
 		ESP_LOGE(TAG, "  bus init failed: %s", esp_err_to_name(err));
