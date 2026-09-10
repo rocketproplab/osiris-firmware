@@ -67,6 +67,12 @@ esp_err_t ai_spi_device_add(spi_host_device_t host,
 
 esp_err_t ai_spi_device_remove(ai_spi_device_handle_t device);
 
+// Raw full-duplex transfer, for devices whose framing is not
+// address-then-payload. Either buffer may be NULL. `len` bytes are clocked
+// out and in; it must be 1..AI_SPI_MAX_REG_LEN + 1.
+esp_err_t ai_spi_transfer(ai_spi_device_handle_t device,
+                          const uint8_t *tx, uint8_t *rx, size_t len);
+
 // Register access. `reg` is the bare address; the read flag is applied
 // internally. `len` must be 1..AI_SPI_MAX_REG_LEN.
 esp_err_t ai_spi_read_regs(ai_spi_device_handle_t device, uint8_t reg, uint8_t *data, size_t len);

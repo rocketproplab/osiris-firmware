@@ -138,6 +138,24 @@ esp_err_t ai_spi_device_remove(ai_spi_device_handle_t device) {
 	return err;
 }
 
+esp_err_t ai_spi_transfer(ai_spi_device_handle_t device,
+                          const uint8_t *tx, uint8_t *rx, size_t len) {
+	if (device == NULL || len == 0 || (tx == NULL && rx == NULL)) {
+		return ESP_ERR_INVALID_ARG;
+	}
+	if (len > AI_SPI_MAX_REG_LEN + 1) {
+		return ESP_ERR_INVALID_SIZE;
+	}
+
+	spi_transaction_t transaction = {
+		.length = len * 8,
+		.tx_buffer = tx,
+		.rx_buffer = rx,
+	};
+
+	return spi_device_polling_transmit(device->handle, &transaction);
+}
+
 esp_err_t ai_spi_read_regs(ai_spi_device_handle_t device, uint8_t reg, uint8_t *data, size_t len) {
 	if (device == NULL || data == NULL || len == 0) {
 		return ESP_ERR_INVALID_ARG;

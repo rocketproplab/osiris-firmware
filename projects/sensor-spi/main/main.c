@@ -6,6 +6,7 @@
 
 #include "ai_lsm6dsox.h"
 #include "ai_spi.h"
+#include "spi_probe.h"
 
 #include "esp_err.h"
 #include "esp_log.h"
@@ -38,6 +39,9 @@ static const char *TAG = "sensor-spi";
 
 #define SAMPLE_PERIOD_MS 250
 
+// Bring-up diagnostics. Set to 0 once the link is trusted.
+#define RUN_PROBE 1
+
 static esp_err_t spi_read_regs(void *ctx, uint8_t reg, uint8_t *data, size_t len) {
 	return ai_spi_read_regs((ai_spi_device_handle_t)ctx, reg, data, len);
 }
@@ -53,14 +57,19 @@ void app_main(void) {
 		.mosi_gpio = PIN_MOSI,
 		.miso_gpio = PIN_MISO,
 	};
-	ESP_ERROR_CHECK(ai_spi_bus_init(&bus_config));
-
 	const ai_spi_device_config_t device_config = {
 		.cs_gpio = PIN_CS,
 		.clock_speed_hz = SPI_CLOCK_HZ,
 		.mode = SPI_MODE,
 		.reg_read_flag = AI_SPI_READ_FLAG_MSB,
 	};
+
+#if RUN_PROBE
+	spi_probe_run(&bus_config, &device_config);
+#endif
+
+	ESP_ERROR_CHECK(ai_spi_bus_init(&bus_config));
+
 	ai_spi_device_handle_t spi_device = NULL;
 	ESP_ERROR_CHECK(ai_spi_device_add(SPI_HOST_ID, &device_config, &spi_device));
 
