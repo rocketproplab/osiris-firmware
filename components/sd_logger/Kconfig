@@ -1,0 +1,84 @@
+menu "SD Logger"
+
+# =====================================================================
+#  These are component-local on purpose, unlike the task priorities.
+#
+#  Queue depth and buffer size only affect sd_logger's own behavior and
+#  RAM footprint -- nothing outside this component needs to reason about
+#  them. Priorities went in main/Kconfig.projbuild instead because they
+#  are only meaningful relative to every other task in the system.
+# =====================================================================
+
+config SD_QUEUE_MARGIN_MS
+    int "Queue depth margin beyond one flush interval (ms)"
+    range 0 5000
+    default 500
+    help
+        Each of the three sensor streams now has its OWN queue
+        (previously one shared queue for all three -- a burst from a
+        fast sensor could evict a slower sensor's still-unwritten data
+        purely by sharing capacity with it). Depth is no longer a
+        single number you set directly; each stream's depth is derived
+        from ITS OWN rate: rate_hz x (SD_LOGGER_FLUSH_MS + this margin)
+        / 1000. See BARO_QUEUE_DEPTH/IMU_QUEUE_DEPTH/GPS_QUEUE_DEPTH in
+        sd_logger.h for the exact formula and resulting numbers.
+
+        Raising this gives every stream more headroom to absorb a card
+        stall beyond one flush interval, at the cost of RAM
+        proportional to that stream's own rate (IMU costs the most per
+        added millisecond of margin, since it publishes fastest).
+
+        Check sd_logger_diag_t.queue_full_drops after a flight -- if
+        nonzero, raise this rather than guessing.
+
+config SD_LOGGER_BUF_SIZE
+    int "Per-stream write buffer (bytes)"
+    range 128 4096
+    default 512
+    help
+        Bytes buffered per stream before touching the card. There are
+        three streams, so total cost is 3x this value.
+
+        512 keeps any single write within one SD sector. It does NOT
+        guarantee flushes land on aligned sector boundaries -- flush
+        sizes vary by record size and rarely divide evenly into 512,
+        so most flushes are smaller than a full sector and drift out
+        of alignment over time. Unaligned writes cost the card an
+        extra internal read-merge-write; this is real but small next
+        to the stall tolerance this queue already provides. Padding to
+        force alignment was considered and rejected: it would bloat
+        the GPS file (~36 real bytes per second padded to 512, over
+        90% waste) for a benefit smaller than what this buffer already
+        absorbs. Keep this at 512 unless you have measured a specific
+        throughput problem.
+
+config SD_LOGGER_FLUSH_MS
+    int "Periodic flush interval (ms)"
+    range 100 60000
+    default 1000
+    help
+        Every stream is flushed at least this often even if its buffer
+        is not full.
+
+        This exists for the slow streams: GPS at 1 Hz writes 36 bytes
+        per fix, so a 512-byte buffer would take roughly 14 minutes to
+        fill on its own. Without a periodic flush, a power cut would
+        lose every GPS fix since the last one.
+
+        Lower means less data at risk on a sudden power loss, at the
+        cost of more frequent (and more wearing) card writes.
+
+config SD_LOGGER_STACK_WORDS
+    int "Writer task stack (words, not bytes)"
+    range 2048 8192
+    default 4096
+    help
+        FreeRTOS stack sizes on ESP-IDF are in 32-bit WORDS, so the
+        default 4096 is 16 KB of actual RAM.
+
+        The writer task calls into FATFS and the C standard library's
+        buffered I/O, both of which are more stack-hungry than the
+        sensor drivers. Verify with uxTaskGetStackHighWaterMark() in
+        your own build before trimming this.
+
+endmenu

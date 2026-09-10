@@ -16,9 +16,9 @@
 
 #include <stdio.h>
 #include <string.h>
+#include "ai_gps_config.h"
 
 #include "driver/uart.h"
-#include "esp_err.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"

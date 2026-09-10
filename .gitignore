@@ -3,3 +3,4 @@ sdkconfig.old
 build/
 managed_components/
 .vscode/
+*.code-workspace

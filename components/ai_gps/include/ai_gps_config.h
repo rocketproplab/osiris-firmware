@@ -1,4 +1,4 @@
-#ifndef GPS_CONFIG.h
+#pragma once;
 
+#include "esp_err.h"
 
-#endif;
