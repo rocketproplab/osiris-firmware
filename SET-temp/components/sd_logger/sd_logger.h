@@ -121,7 +121,7 @@
  * =================================================================== */
 
 #define SD_LOG_MAGIC        "SETLOG"
-#define SD_LOG_VERSION      1
+#define SD_LOG_VERSION      2   /* 2: status_record_t lost battery_v (32 -> 28 bytes) */
 
 typedef struct __attribute__((packed)) {
     char     magic[6];        // "SETLOG"

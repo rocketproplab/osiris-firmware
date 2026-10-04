@@ -643,7 +643,7 @@ _Static_assert(sizeof(gps_record_t)    == 34, "gps.bin format changed -- bump th
 _Static_assert(sizeof(batt_record_t)   == 20, "batt.bin format changed -- bump the log version");
 _Static_assert(sizeof(err_record_t)    == 24, "err.bin format changed -- bump the log version");
 _Static_assert(sizeof(event_record_t)  == 20, "event.bin format changed -- bump the log version");
-_Static_assert(sizeof(status_record_t) == 32, "status.bin format changed -- bump the log version");
+_Static_assert(sizeof(status_record_t) == 28, "status.bin format changed -- bump the log version");
 
 /* sd_drain_one_rb()'s scratch buffer is SENSOR_RECORD_MAX_SIZE bytes and
  * ring_buffer_pop() writes elem_size into it, so every record must fit. */

@@ -157,10 +157,14 @@
  *  Wrap-safe: newer means (seq - last) is in the lower half of the
  *  16-bit space, so the counter can roll over without locking up.
  *
- *  THE CRC IS NOT SECURITY. It rejects corruption, not an attacker. The
- *  only command that can lose data is DISARM, and flight_mode refuses
- *  that outright while the vehicle is flying -- the state machine, not
- *  the packet format, is what protects the flight record.
+ *  THE CRC IS NOT SECURITY. It rejects corruption, not an attacker. Two
+ *  commands can cost you the record -- DISARM and SD_EJECT -- and in
+ *  both cases it is the state machine that refuses them while the
+ *  vehicle is flying, not the packet format. SD_EJECT is the stricter
+ *  of the two: DISARM is allowed from ARMED, an eject is not, because
+ *  a vehicle on the pad with its card unmounted is a vehicle that will
+ *  fly with no flight recorder and report STATUS_FLAG_SD_OK clear the
+ *  whole way up.
  * =================================================================== */
 
 #define TELEMETRY_CMD_MAGIC       0x5A
@@ -173,6 +177,24 @@ typedef enum {
     CMD_DISARM = 0x2,   /* -> STANDBY; refused while in FLIGHT */
     CMD_PING   = 0x3,   /* emit a status record immediately */
     CMD_MARK   = 0x4,   /* write an operator marker into event.bin */
+    /* Flush the buffers, close the files and unmount the card, so it
+     * can be pulled without corrupting the filesystem. Accepted only
+     * in STANDBY and LANDED; refused in ARMED and FLIGHT, which is
+     * recorded as EV_UPLINK_REJECTED. ONE WAY: there is deliberately
+     * no remount opcode, so the only route back to logging is a power
+     * cycle. A half-working remount that silently logged to nothing
+     * would be worse than an obvious one, and the confirmation the
+     * ground watches for -- STATUS_FLAG_SD_OK going clear -- means
+     * exactly one thing if the bit can never come back on its own. */
+    CMD_SD_EJECT = 0x5,
+    /* Make the config that was uploaded into NVS the LIVE one, without
+     * a power cycle. Accepted only in STANDBY and LANDED -- the same
+     * gate as the eject, and for a related reason: swapping deployment
+     * thresholds is not something to do to a vehicle that is armed or
+     * flying. Storing a config is always allowed; only applying it is
+     * gated, so an upload can be staged on the pad and committed when
+     * the operator is ready. */
+    CMD_CONFIG_APPLY = 0x6,
     CMD_COUNT
 } telemetry_cmd_t;
 
@@ -263,5 +285,38 @@ void telemetry_get_diagnostics(telemetry_handle_t dev, telemetry_diag_t *out);
  * status producer polls this. Done as a flag rather than a callback so
  * telemetry needs no knowledge of who assembles a status record. */
 bool telemetry_take_ping_request(telemetry_handle_t dev);
+
+/* Returns true once per ACCEPTED CMD_SD_EJECT, clearing the request.
+ * Same flag-not-callback shape as the ping above, and for a stronger
+ * reason: unmounting means calling sd_logger_stop(), and telemetry has
+ * no business knowing sd_logger exists -- the host test compiles
+ * telemetry.c without it. Whoever owns the SD handle polls this and
+ * does the work. That is main.c's status_task, which already polls for
+ * pings, already holds every handle, and is the one task that can
+ * afford to block for the ~0.5 s the unmount takes. */
+bool telemetry_take_sd_eject_request(telemetry_handle_t dev);
+
+/* Returns true once per ACCEPTED CMD_CONFIG_APPLY. Polled by whoever
+ * owns the live deploy_config_t -- flight_logic's task -- so that the
+ * config is swapped by the task that reads it, between ticks, instead
+ * of underneath it from somewhere else. */
+bool telemetry_take_config_apply_request(telemetry_handle_t dev);
+
+/* ===================================================================
+ *  Uplink hook
+ *
+ *  Not every uplink packet is a command. The config upload carries its
+ *  own magic (0x5B) and is reassembled by a component telemetry knows
+ *  nothing about -- deliberately: telemetry.c is compiled on its own by
+ *  the host test, and making it depend on NVS and a reassembly buffer
+ *  to parse a radio frame would be backwards.
+ *
+ *  So an RF payload is offered to the hook first. A hook that returns
+ *  true has consumed the packet; false falls through to the ordinary
+ *  command parser. No hook installed means the old behaviour exactly.
+ * =================================================================== */
+typedef bool (*telemetry_uplink_hook_t)(const uint8_t *payload, uint16_t len);
+
+void telemetry_set_uplink_hook(telemetry_handle_t dev, telemetry_uplink_hook_t hook);
 
 #endif // TELEMETRY_H

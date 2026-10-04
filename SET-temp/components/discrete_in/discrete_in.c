@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include "discrete_in.h"
 
 #include <string.h>
@@ -20,6 +21,13 @@ struct discrete_in_dev {
     TaskHandle_t        task;
 
     volatile uint64_t   isr_timestamp_us;
+    /* The accepted-trigger count AT THE MOMENT OF THAT EDGE, captured
+     * in the ISR. The task used to read diag.triggers twice -- once for
+     * its log line, once for the event record -- and on a chattering
+     * input the ISR bumped it between the two, so the console and the
+     * flight log disagreed about the same edge. */
+    volatile uint32_t   isr_trigger_count;
+    volatile uint64_t   last_accepted_us;
     volatile bool       fired;
     discrete_in_diag_t    diag;
 };
@@ -43,12 +51,26 @@ static void IRAM_ATTR discrete_in_isr(void *arg)
     BaseType_t hp_task_woken = pdFALSE;
 
     uint64_t now = (uint64_t)esp_timer_get_time();
+
+    /* Rejected here rather than in the task: a suppressed edge must not
+     * cost a notify, a wake, or a console line, since the whole problem
+     * being solved is this task running too often. `fired` doubles as
+     * "we have accepted one already", so the first edge always gets
+     * through with its exact timestamp. */
+    if (DISCRETE_IN_MIN_INTERVAL_US > 0 && dev->fired &&
+        (now - dev->last_accepted_us) < DISCRETE_IN_MIN_INTERVAL_US) {
+        dev->diag.suppressed++;
+        return;
+    }
+
     dev->isr_timestamp_us = now;
+    dev->last_accepted_us = now;
     if (!dev->fired) {
         dev->diag.first_trigger_us = now;
         dev->fired = true;
     }
     dev->diag.triggers++;
+    dev->isr_trigger_count = dev->diag.triggers;
 
     vTaskNotifyGiveFromISR(dev->task, &hp_task_woken);
     portYIELD_FROM_ISR(hp_task_woken);
@@ -72,19 +94,31 @@ static void discrete_in_task(void *arg)
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-        uint64_t ts = dev->isr_timestamp_us;
+        /* Both of these come from what the ISR captured for THIS edge,
+         * so the console line and the flight record cannot disagree
+         * about it. They used to be two separate reads of
+         * diag.triggers, which a chattering input changed in between. */
+        uint64_t ts    = dev->isr_timestamp_us;
+        uint32_t count = dev->isr_trigger_count;
+        uint32_t sup   = dev->diag.suppressed;
 
-        ESP_LOGW(TAG, "%s SIGNAL at %llu us (trigger #%lu)",
-                 dev->cfg.name ? dev->cfg.name : "discrete",
-                 (unsigned long long)ts,
-                 (unsigned long)dev->diag.triggers);
+        if (sup) {
+            ESP_LOGW(TAG, "%s SIGNAL at %llu us (trigger #%lu, %lu edge(s) "
+                          "suppressed so far -- the line is chattering)",
+                     dev->cfg.name ? dev->cfg.name : "discrete",
+                     (unsigned long long)ts, (unsigned long)count,
+                     (unsigned long)sup);
+        } else {
+            ESP_LOGW(TAG, "%s SIGNAL at %llu us (trigger #%lu)",
+                     dev->cfg.name ? dev->cfg.name : "discrete",
+                     (unsigned long long)ts, (unsigned long)count);
+        }
 
         /* Recorded from the task, not the ISR: event_log ends in a ring
          * buffer push, which sd_logger does not support from interrupt
          * context. Passing the ISR timestamp through keeps the recorded
          * time honest anyway. */
-        event_log_event_at(dev->cfg.event, dev->cfg.channel,
-                           dev->diag.triggers, ts);
+        event_log_event_at(dev->cfg.event, dev->cfg.channel, count, ts);
 
         if (dev->cfg.output_pin != GPIO_NUM_NC) {
             gpio_set_level(dev->cfg.output_pin, DISCRETE_IN_OUTPUT_ACTIVE_LEVEL);
@@ -150,7 +184,17 @@ esp_err_t discrete_in_init(const discrete_in_config_t *cfg, discrete_in_handle_t
         .pin_bit_mask = 1ULL << dev->cfg.input_pin,
         .mode         = GPIO_MODE_INPUT,
         .pull_up_en   = GPIO_PULLUP_DISABLE,
+        /* OFF on PCB v1: the board's divider already holds this low, and
+         * the internal ~45k in parallel would shift the ratio from
+         * 0.434 to 0.415 -- making a real Blue Raven trigger HARDER to
+         * reach, not easier. ON only where the divider is absent, such
+         * as a bare module on a breadboard, where the pin would float
+         * and generate thousands of edges a second. */
+#ifdef CONFIG_DISCRETE_IN_INTERNAL_PULLDOWN
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+#else
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
+#endif
         .intr_type    = GPIO_INTR_POSEDGE,
     };
     esp_err_t err = gpio_config(&in_io);

@@ -63,7 +63,8 @@ typedef enum {
     MODE_SRC_UPLINK,       // command from the ground station
     MODE_SRC_IMU_WAKEUP,   // LSM6DSOX INT2 -- the backup trigger
     MODE_SRC_FLIGHT_LOGIC, // software liftoff / apogee / landing detector
-    MODE_SRC_BOOT
+    MODE_SRC_BOOT,
+    MODE_SRC_TEST          // scripted sequence in a TEST build (appended, never inserted)
 } mode_source_t;
 
 /* STREAM_BATT is house-keeping, not flight data, and it is deliberately
@@ -203,8 +204,44 @@ typedef enum {
      * them. channel = the burn's number (1 = first), detail = now_ms. */
     EV_BURN_START,           // flight_logic saw axial thrust begin
     EV_BURN_END,             // ...and end. BURNCOUNT counts the starts.
+    /* The card was flushed, closed and unmounted on an operator's
+     * CMD_SD_EJECT. This is the LAST record any stream writes to the
+     * card, by construction: it is logged before the router is
+     * detached, so the file it explains is the file it ends. A log
+     * whose tail is anything else was cut off by something that was
+     * not an eject. */
+    EV_SD_UNMOUNTED,         // channel = flight_mode_t, detail = SD_UNMOUNT_CAUSE_*
+    /* Deployment-config upload from the ground. Appended like the rest:
+     * an old decoder reading a new log gets an unknown name for these,
+     * never a wrong name for everything after them. */
+    EV_CONFIG_RX,            // channel = chunks received, detail = chunks expected
+    EV_CONFIG_STORED,        // a complete, CRC-checked config reached NVS
+                             //   detail = bytes stored
+    EV_CONFIG_REJECTED,      // channel = CFG_REJECT_*, detail = reason-specific
+    EV_CONFIG_APPLIED,       // the stored config is now the live one
+                             //   channel = flight_mode_t at the time
     EV_COUNT
 } event_type_t;
+
+/* Why the card was unmounted, carried in EV_SD_UNMOUNTED's detail
+ * field. UPLINK is 0 so that logs written before the auto-eject timer
+ * existed -- which recorded a plain 0 -- still read correctly. */
+#define SD_UNMOUNT_CAUSE_UPLINK   0u
+#define SD_UNMOUNT_CAUSE_TIMER    1u
+
+/* Why a config upload was not stored, carried in EV_CONFIG_REJECTED's
+ * channel. Each one wants a different response from the operator, which
+ * is the whole reason they are not one "it failed" code:
+ *   INCOMPLETE -- chunks were lost; detail = the first missing index
+ *   CRC        -- every chunk arrived but the bytes are wrong;
+ *                 detail = the CRC actually computed
+ *   TOO_LARGE  -- the config exceeds CONFIG_RX_MAX_BYTES;
+ *                 detail = the size that was announced
+ *   NVS        -- it was valid but the write failed; detail = esp_err */
+#define CFG_REJECT_INCOMPLETE     1u
+#define CFG_REJECT_CRC            2u
+#define CFG_REJECT_TOO_LARGE      3u
+#define CFG_REJECT_NVS            4u
 
 typedef struct __attribute__((packed)) {
     uint32_t seq;
@@ -245,16 +282,17 @@ typedef struct __attribute__((packed)) {
     uint8_t  mode;            // flight_mode_t
     uint8_t  flags;           // STATUS_FLAG_*
     uint16_t uptime_s;
-    float    battery_v;
+    /* No battery_v: batt.bin (STREAM_BATT) already carries it at 10 Hz,
+     * on the card and on the downlink. Removed in log version 2. */
     float    altitude_agl_m;
     uint32_t sd_drops;
     uint32_t telem_drops;
-} status_record_t;            // 32 bytes
+} status_record_t;            // 28 bytes
 
 /* Largest of the seven, used by anything sizing a fixed buffer to hold
  * "whichever record type this happens to be" -- e.g. the router and
  * each subsystem's internal queue item. Still 36 (imu_record_t);
- * status_record_t is 32. */
+ * status_record_t is 28. */
 #define SENSOR_RECORD_MAX_SIZE   40
 
 /* ===================================================================

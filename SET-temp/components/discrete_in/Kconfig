@@ -1,0 +1,47 @@
+menu "Discrete inputs (Blue Raven staging / recovery)"
+
+config DISCRETE_IN_MIN_INTERVAL_MS
+    int "Minimum interval between accepted edges (ms, 0 = accept every edge)"
+    range 0 5000
+    default 50
+    help
+        An edge arriving sooner than this after the last ACCEPTED one is
+        counted as suppressed and otherwise ignored. The first edge is
+        always accepted, with its exact ISR-captured timestamp -- this
+        only ever discards what FOLLOWS a real signal.
+
+        This is not cosmetic. These tasks run at the highest priority in
+        the system (FC_PRIO_DISCRETE, above the sensor readers), and
+        each accepted edge writes a console line and pushes an event to
+        the card and the downlink. An input that chatters therefore
+        starves everything below it: a floating GPIO23 on the bench
+        produced ~6700 edges/s and timed out the I2C sensor reads, which
+        looked like a bus fault and was not one.
+
+        A Blue Raven cannot assert the same line twice within 50 ms, and
+        staging and recovery are separate pins with separate counters,
+        so the default cannot discard a real deployment signal. Lower it
+        only if you have a specific reason to expect faster genuine
+        pulses on ONE line.
+
+        0 restores the old accept-everything behaviour.
+
+config DISCRETE_IN_INTERNAL_PULLDOWN
+    bool "Enable the internal pulldown on discrete inputs"
+    default n
+    help
+        OFF for flight, and for any build running on PCB v1.
+
+        The board already holds each input low through its divider
+        (R5/R8 on staging, R8/R9 on recovery). Enabling the internal
+        pulldown (~45k) in parallel with those shifts the divider ratio
+        from 0.434 to 0.415, which raises the voltage the Blue Raven
+        must produce before the pin reads HIGH -- it makes a real
+        trigger HARDER to see, and the window in PCB_v1_wiring.md
+        assumes 0.434.
+
+        Turn it ON only when the divider is not present -- a bare module
+        on a breadboard, for instance -- where the pin would otherwise
+        float and generate thousands of spurious edges a second.
+
+endmenu

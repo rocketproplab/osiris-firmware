@@ -1,0 +1,47 @@
+menu "SET sensor bus (BMP388 + LSM6DSOX)"
+
+    choice SET_SENSOR_BUS
+        prompt "Interface"
+        default SET_SENSOR_BUS_I2C
+        help
+            Both sensors share the same three wires (GPIO54, GPIO19, GPIO18),
+            so they run as one bus or the other -- never a mix.
+
+            SPI IS NOT IMPLEMENTED YET. Selecting it builds, but every
+            transfer returns ESP_ERR_NOT_SUPPORTED and no sensor comes up.
+            I2C is the default until the SPI branch of sensor_bus.c is
+            filled in.
+
+            AFTER CHANGING THIS, REMOVE ALL POWER (battery and USB) before
+            testing. The BMP388 switches itself to SPI the first time its CS
+            pin goes low and stays in SPI until it loses power. Pressing reset
+            on the ESP32 does not cut power to the sensors.
+
+        config SET_SENSOR_BUS_SPI
+            bool "SPI (NOT IMPLEMENTED -- stubs only)"
+
+        config SET_SENSOR_BUS_I2C
+            bool "I2C (working)"
+    endchoice
+
+    config SET_SENSOR_SPI_FREQ_HZ
+        int "SPI clock (Hz)"
+        depends on SET_SENSOR_BUS_SPI
+        range 100000 10000000
+        default 1000000
+        help
+            Kept so the SPI branch has a clock to use once it is written.
+            Both sensors allow up to 10 MHz. 1 MHz moves a full IMU sample in
+            about 0.1 ms and is far more forgiving of long wires and breakout
+            level-shifters. Raise it only after the chip-ID check passes.
+
+    config SET_SENSOR_I2C_FREQ_HZ
+        int "I2C clock (Hz)"
+        depends on SET_SENSOR_BUS_I2C
+        range 100000 400000
+        default 400000
+        help
+            400 kHz is the fastest standard I2C speed both sensors support.
+            Drop to 100000 if the bus scan at boot finds nothing.
+
+endmenu

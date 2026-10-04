@@ -27,6 +27,23 @@
 
 esp_err_t data_router_init(sd_logger_handle_t sd, telemetry_handle_t telemetry);
 
+/* Stop routing to the SD logger and return the handle that was
+ * detached (NULL if there wasn't one). The caller then owns it and is
+ * expected to sd_logger_stop() it.
+ *
+ * The order is the point. sd_logger_stop() flushes, closes and
+ * unmounts; a sensor task that publishes in the middle of that would
+ * be handing records to a logger whose files are already closed.
+ * Detaching first means the window is closed before the teardown
+ * starts. sd_logger_write() also guards on its own `initialized` flag,
+ * so a task already inside publish() when this runs gets a rejected
+ * write rather than anything worse -- but that is the backstop, not
+ * the plan.
+ *
+ * Detaching is one way. There is no re-attach, because there is no
+ * remount command for it to pair with. */
+sd_logger_handle_t data_router_detach_sd(void);
+
 esp_err_t data_router_publish(sensor_stream_t stream, const void *record, size_t len);
 
 #endif // DATA_ROUTER_H

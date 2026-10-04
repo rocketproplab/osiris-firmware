@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include "telemetry.h"
 
 #include <string.h>
@@ -56,6 +57,9 @@ struct telemetry_dev {
     uint16_t             last_cmd_seq;
     bool                 have_cmd_seq;
     volatile bool        ping_requested;
+    volatile bool        sd_eject_requested;
+    volatile bool        config_apply_requested;
+    telemetry_uplink_hook_t uplink_hook;
 
     StaticTask_t         tcb;
     StackType_t          stack[TELEMETRY_STACK_WORDS];
@@ -305,6 +309,25 @@ static void telemetry_handle_at_response(struct telemetry_dev *dev,
  *  refused disarm.
  * =================================================================== */
 
+/* TEMPORARY -- uplink trace. Set XBEE_RX_TRACE to 0 to silence.
+ * Logs every 0x90 that reaches the parser, and makes the two rejection
+ * paths that are otherwise silent (wrong magic/length, stale seq) say
+ * so. Answers "did the packet arrive?" separately from "was it
+ * accepted?". */
+#define XBEE_RX_TRACE  1
+
+#if XBEE_RX_TRACE
+static void xbee_trace_hex(const char *what, const uint8_t *p, uint16_t len)
+{
+    char hex[24 * 3 + 1];
+    const uint16_t n = len < 24 ? len : 24;
+    for (uint16_t k = 0; k < n; k++) { snprintf(&hex[k * 3], 4, "%02X ", p[k]); }
+    hex[n * 3] = '\0';
+    ESP_LOGW(TAG, "rx trace: %s (%u bytes): %s%s", what, (unsigned)len, hex,
+             len > n ? "..." : "");
+}
+#endif
+
 static bool seq_is_newer(uint16_t seq, uint16_t last)
 {
     /* Wrap-safe: newer means the unsigned distance is in the lower half
@@ -319,6 +342,11 @@ static void telemetry_handle_command(struct telemetry_dev *dev,
     if (len < TELEMETRY_CMD_SIZE || pkt[0] != TELEMETRY_CMD_MAGIC) {
         portENTER_CRITICAL(&dev->diag_lock); dev->diag.cmds_malformed++;
         portEXIT_CRITICAL(&dev->diag_lock);
+#if XBEE_RX_TRACE
+        ESP_LOGW(TAG, "rx trace: not a command -- len %u (need %d), first byte 0x%02X "
+                      "(need 0x%02X)", (unsigned)len, TELEMETRY_CMD_SIZE,
+                 len ? pkt[0] : 0, TELEMETRY_CMD_MAGIC);
+#endif
         return;
     }
     if ((pkt[1] >> 4) != TELEMETRY_CMD_VERSION) {
@@ -344,6 +372,11 @@ static void telemetry_handle_command(struct telemetry_dev *dev,
     if (dev->have_cmd_seq && !seq_is_newer(seq, dev->last_cmd_seq)) {
         portENTER_CRITICAL(&dev->diag_lock); dev->diag.cmds_stale++;
         portEXIT_CRITICAL(&dev->diag_lock);
+#if XBEE_RX_TRACE
+        ESP_LOGW(TAG, "rx trace: STALE -- seq %u is not newer than last accepted %u. "
+                      "Reboot the vehicle or reset tools/.uplink_seq.",
+                 (unsigned)seq, (unsigned)dev->last_cmd_seq);
+#endif
         return;   /* the XBee's own retransmit, or a replay */
     }
 
@@ -368,6 +401,49 @@ static void telemetry_handle_command(struct telemetry_dev *dev,
         event_log_event(EV_UPLINK_COMMAND, (uint8_t)CMD_MARK, arg);
         acted = true;
         break;
+    case CMD_CONFIG_APPLY: {
+        /* Same gate as the eject, same reasoning, and the mode is read
+         * once so the decision and the logged detail cannot disagree. */
+        flight_mode_t m = flight_mode_get();
+        if (m == MODE_STANDBY || m == MODE_LANDED) {
+            dev->config_apply_requested = true;
+            acted = true;
+        } else {
+            event_log_event(EV_UPLINK_REJECTED, (uint8_t)CMD_CONFIG_APPLY, (uint32_t)m);
+            ESP_LOGW(TAG, "uplink: config apply refused in %s", flight_mode_name(m));
+            acted = false;
+        }
+        break;
+    }
+    case CMD_SD_EJECT: {
+        /* The gate is here rather than in whoever performs the unmount
+         * because this is where a refusal can still be told apart from
+         * a command that never arrived -- the same reason flight_mode
+         * records its own refused disarm. The mode is read once and
+         * used for both the decision and the event detail, so the log
+         * says what state the vehicle believed it was in.
+         *
+         * STANDBY and LANDED only. ARMED is excluded on purpose even
+         * though disarm is allowed from it: disarm is reversible and an
+         * eject is not, and the pad is exactly where somebody reaches
+         * for the wrong button. */
+        flight_mode_t m = flight_mode_get();
+        if (m == MODE_STANDBY || m == MODE_LANDED) {
+            dev->sd_eject_requested = true;
+            /* Answer with a status record immediately instead of making
+             * the operator wait out the 1 Hz tick: the unmount happens
+             * in the same task that builds that record, so the first
+             * status after this one is the one with SD_OK clear. That
+             * is the whole confirmation path, and it should be fast. */
+            dev->ping_requested = true;
+            acted = true;
+        } else {
+            event_log_event(EV_UPLINK_REJECTED, (uint8_t)CMD_SD_EJECT, (uint32_t)m);
+            ESP_LOGW(TAG, "uplink: SD eject refused in %s", flight_mode_name(m));
+            acted = false;
+        }
+        break;
+    }
     default:
         portENTER_CRITICAL(&dev->diag_lock); dev->diag.cmds_malformed++;
         portEXIT_CRITICAL(&dev->diag_lock);
@@ -407,14 +483,34 @@ static void telemetry_pump_rx(struct telemetry_dev *dev)
         case XBEE_FRAME_TX_STATUS:   telemetry_handle_tx_status(dev, f, flen); break;
         case XBEE_FRAME_AT_RESPONSE: telemetry_handle_at_response(dev, f, flen); break;
         case XBEE_FRAME_RX_PACKET:
-            /* 0x90: type, src64[8], reserved[2], options, then payload. */
+#if XBEE_RX_TRACE
+            xbee_trace_hex("0x90 received, payload", flen > 12 ? &f[12] : f,
+                           flen > 12 ? (uint16_t)(flen - 12) : flen);
+#endif
+            /* 0x90: type, src64[8], reserved[2], options, then payload.
+             * The hook gets first refusal -- see the uplink hook notes
+             * in telemetry.h. */
             if (flen > 12) {
-                telemetry_handle_command(dev, &f[12], (uint16_t)(flen - 12));
+                const uint8_t *pl = &f[12];
+                const uint16_t pl_len = (uint16_t)(flen - 12);
+                if (!dev->uplink_hook || !dev->uplink_hook(pl, pl_len)) {
+                    telemetry_handle_command(dev, pl, pl_len);
+                }
             }
             break;
-        default: break;
+        default:
+#if XBEE_RX_TRACE
+            xbee_trace_hex("unhandled frame", f, flen);
+#endif
+            break;
         }
     }
+#if XBEE_RX_TRACE
+    if (dev->parser.bad_checksums != dev->diag.bad_checksums) {
+        ESP_LOGW(TAG, "rx trace: XBee frame checksum failures now %u",
+                 (unsigned)dev->parser.bad_checksums);
+    }
+#endif
     portENTER_CRITICAL(&dev->diag_lock);
     dev->diag.bad_checksums = dev->parser.bad_checksums;
     portEXIT_CRITICAL(&dev->diag_lock);
@@ -593,10 +689,259 @@ static bool xbee_probe(struct telemetry_dev *dev, uint32_t *version_out)
     return false;
 }
 
+/* ===================================================================
+ *  TEMPORARY -- raw UART dump.
+ *
+ *  Set XBEE_RAW_DUMP_MS to 0, or delete this block and its two calls in
+ *  xbee_bringup(), once the radio is verified.
+ *
+ *  Without a scope this is the only way to see what the module actually
+ *  puts on DOUT. Note that xbee_bringup() normally calls
+ *  uart_flush_input() before it probes -- so anything the module said
+ *  at power-up has always been discarded unread. These dumps run
+ *  BEFORE those flushes.
+ *
+ *  Read the verdict line, not the hex:
+ *
+ *    API frames    bytes start 0x7E -- the module IS in API mode and
+ *                  IS talking. If ATVR still fails after this, the
+ *                  fault is in what we SEND on DIN, not the module.
+ *    ASCII text    a bootloader banner or an AT-mode reply. The module
+ *                  is not in API mode at this moment.
+ *    no structure  neither -- a baud mismatch, or two drivers fighting
+ *                  over the line.
+ *    SILENT        nothing at all, so nothing is reaching GPIO4.
+ * =================================================================== */
+#define XBEE_RAW_DUMP_MS   1500
+#define XBEE_RAW_DUMP_MAX  256
+
+#if XBEE_RAW_DUMP_MS > 0
+static void xbee_dump_raw(struct telemetry_dev *dev, const char *when)
+{
+    static uint8_t cap[XBEE_RAW_DUMP_MAX];
+    size_t   used = 0;
+    uint32_t total = 0, printable = 0, sof = 0;
+
+    const int64_t deadline =
+        esp_timer_get_time() + (int64_t)XBEE_RAW_DUMP_MS * 1000;
+
+    while (esp_timer_get_time() < deadline) {
+        uint8_t buf[64];
+        int got = uart_read_bytes(dev->cfg.uart_port, buf, sizeof buf,
+                                  pdMS_TO_TICKS(20));
+        for (int i = 0; i < got; i++) {
+            const uint8_t b = buf[i];
+            total++;
+            if (b == 0x7E) { sof++; }
+            if ((b >= 0x20 && b < 0x7F) || b == '\r' || b == '\n') {
+                printable++;
+            }
+            if (used < sizeof cap) { cap[used++] = b; }
+        }
+    }
+
+    if (total == 0) {
+        ESP_LOGW(TAG, "raw dump [%s]: SILENT -- nothing on DOUT in %d ms",
+                 when, XBEE_RAW_DUMP_MS);
+        return;
+    }
+
+    ESP_LOGW(TAG, "raw dump [%s]: %u bytes, %u start-delimiters (0x7E), "
+                  "%u%% printable",
+             when, (unsigned)total, (unsigned)sof,
+             (unsigned)(printable * 100u / total));
+
+    for (size_t off = 0; off < used; off += 16) {
+        char   hex[16 * 3 + 1];
+        char   asc[17];
+        size_t n = (used - off < 16) ? (used - off) : 16;
+        for (size_t k = 0; k < n; k++) {
+            const uint8_t b = cap[off + k];
+            snprintf(&hex[k * 3], 4, "%02X ", b);
+            asc[k] = (b >= 0x20 && b < 0x7F) ? (char)b : '.';
+        }
+        hex[n * 3] = '\0';
+        asc[n]     = '\0';
+        ESP_LOGW(TAG, "  %04u  %-48s |%s|", (unsigned)off, hex, asc);
+    }
+
+    if (cap[0] == 0x7E) {
+        ESP_LOGW(TAG, "  verdict: API frames -- module is in API mode and "
+                      "talking. Suspect what we SEND on DIN, not the module.");
+    } else if (printable * 100u / total > 80u) {
+        ESP_LOGW(TAG, "  verdict: ASCII text -- bootloader banner or AT mode. "
+                      "The module is NOT in API mode right now.");
+    } else {
+        ESP_LOGW(TAG, "  verdict: no recognisable structure -- baud mismatch, "
+                      "or something else is driving this line.");
+    }
+}
+#endif /* XBEE_RAW_DUMP_MS */
+
+/* ===================================================================
+ *  TEMPORARY -- RX activity test. Set XBEE_RX_ACTIVITY_MS to 0 to skip.
+ *
+ *  The DOUT path test proves SOMETHING drives GPIO4. This one asks the
+ *  next question: when the module is known to be answering, does that
+ *  wire move, and does the UART turn the movement into bytes?
+ *
+ *  Method: with the UART already attached, send one ATAP query (read-
+ *  only, always answered with a 0x88), then watch GPIO4 directly with
+ *  gpio_get_level() -- which reads the pad, not the UART -- counting
+ *  falling edges and the shortest low pulse. Then drain the UART and
+ *  compare what it caught with what we sent. The pin watch and the UART
+ *  see the same wire over the same window, so where they disagree is
+ *  the answer.
+ *
+ *    line never moved     GPIO4 idles high and nothing ever arrives on
+ *                         it. The module answers on its own DOUT (XCTU
+ *                         shows that), so GPIO4 is not on that net.
+ *    our own frame back   GPIO4 is on the DIN net -- it is hearing the
+ *                         ESP's own transmission on GPIO3, not the
+ *                         module. Wrong explorer pin.
+ *    edges but no bytes   the module IS talking and the UART is NOT
+ *                         hearing it: pin routing or baud on our side.
+ *    a 0x88 for AP        receive path works.
+ *
+ *  The shortest low pulse is one bit time, so it estimates the sender's
+ *  baud: ~8.7 us at 115200, ~104 us at 9600.
+ * =================================================================== */
+#define XBEE_RX_ACTIVITY_MS  300   /* watch window; 0 disables */
+#define XBEE_RX_ACTIVITY_MAX 64    /* bytes kept for the hex dump */
+
+#if XBEE_RX_ACTIVITY_MS > 0
+static void xbee_rx_activity_test(struct telemetry_dev *dev)
+{
+    const int pin = dev->cfg.rx_pin;
+    uint8_t sent[XBEE_MAX_FRAME_DATA];
+
+    uart_flush_input(dev->cfg.uart_port);
+    xbee_parser_reset(&dev->parser);
+
+    const uint8_t want_id = next_frame_id(dev);
+    const size_t sent_len = xbee_build_at_query(want_id, 'A', 'P', sent, sizeof sent);
+    if (sent_len == 0 ||
+        uart_write_bytes(dev->cfg.uart_port, (const char *)sent, sent_len) != (int)sent_len) {
+        ESP_LOGW(TAG, "RX activity test: could not send ATAP -- skipping");
+        return;
+    }
+
+    /* Watch the pad while the UART driver clocks the query out of its
+     * TX buffer and the module answers. Busy-polls on purpose: one bit
+     * at 115200 is 8.7 us, far shorter than a tick. */
+    uint32_t samples = 0, lows = 0, edges = 0;
+    int64_t  min_low_us = -1;
+    int64_t  low_start  = 0;
+    int64_t  now        = esp_timer_get_time();
+    const int64_t deadline = now + (int64_t)XBEE_RX_ACTIVITY_MS * 1000;
+    int prev = gpio_get_level(pin);
+
+    while ((now = esp_timer_get_time()) < deadline) {
+        const int lvl = gpio_get_level(pin);
+        samples++;
+        if (lvl == 0) { lows++; }
+        if (prev == 1 && lvl == 0) {
+            edges++;
+            low_start = now;
+        } else if (prev == 0 && lvl == 1 && edges > 0) {
+            const int64_t w = now - low_start;
+            if (min_low_us < 0 || w < min_low_us) { min_low_us = w; }
+        }
+        prev = lvl;
+    }
+
+    /* Everything the UART caught over that same window. */
+    static uint8_t got[XBEE_RX_ACTIVITY_MAX];
+    size_t kept = 0;
+    uint32_t total = 0;
+    bool ap_ok = false, echo = false;
+    uint8_t ap_val = 0;
+    for (;;) {
+        uint8_t buf[64];
+        const int n = uart_read_bytes(dev->cfg.uart_port, buf, sizeof buf, pdMS_TO_TICKS(20));
+        if (n <= 0) { break; }
+        for (int i = 0; i < n; i++) {
+            total++;
+            if (kept < sizeof got) { got[kept++] = buf[i]; }
+            if (!xbee_parser_feed(&dev->parser, buf[i])) { continue; }
+
+            const uint8_t *f = dev->parser.frame;
+            const uint16_t flen = dev->parser.frame_len;
+            uint8_t id = 0, status = 0;
+            const uint8_t *val = NULL;
+            uint16_t val_len = 0;
+            char c0 = 0, c1 = 0;
+
+            if (f[0] == XBEE_FRAME_AT_COMMAND && flen >= 4 &&
+                f[1] == want_id && f[2] == 'A' && f[3] == 'P') {
+                echo = true;            /* our own query came back */
+            } else if (f[0] == XBEE_FRAME_AT_RESPONSE &&
+                       xbee_parse_at_response(f, flen, &id, &c0, &c1, &status, &val, &val_len) &&
+                       id == want_id && c0 == 'A' && c1 == 'P' && status == 0 && val_len >= 1) {
+                ap_ok  = true;
+                ap_val = val[0];
+            }
+        }
+    }
+    xbee_parser_reset(&dev->parser);
+
+    ESP_LOGW(TAG, "=== RX activity test on GPIO%d (sent ATAP, watched %d ms) ===",
+             pin, XBEE_RX_ACTIVITY_MS);
+    ESP_LOGW(TAG, "  pin: %u samples, %u low, %u falling edges, shortest low %d us%s",
+             (unsigned)samples, (unsigned)lows, (unsigned)edges,
+             (int)min_low_us, min_low_us > 0 ? "" : " (none)");
+    if (min_low_us > 0) {
+        ESP_LOGW(TAG, "  pin: shortest low implies roughly %u baud (115200 -> ~9 us)",
+                 (unsigned)(1000000 / min_low_us));
+    }
+    ESP_LOGW(TAG, "  uart: %u bytes", (unsigned)total);
+    for (size_t off = 0; off < kept; off += 16) {
+        char hex[16 * 3 + 1];
+        const size_t n = (kept - off < 16) ? (kept - off) : 16;
+        for (size_t k = 0; k < n; k++) {
+            snprintf(&hex[k * 3], 4, "%02X ", got[off + k]);
+        }
+        hex[n * 3] = '\0';
+        ESP_LOGW(TAG, "  %04u  %s", (unsigned)off, hex);
+    }
+
+    if (samples > 0 && lows == samples) {
+        ESP_LOGW(TAG, "  verdict: line held LOW the whole window -- short to "
+                      "ground or a continuous break. Not an idle UART.");
+    } else if (ap_ok) {
+        ESP_LOGW(TAG, "  verdict: RECEIVE PATH WORKS -- module answered ATAP = %u. "
+                      "If ATVR still fails, the fault is in the probe, not the wire.",
+                 (unsigned)ap_val);
+    } else if (echo) {
+        ESP_LOGW(TAG, "  verdict: OWN FRAME ECHOED -- GPIO%d is hearing GPIO%d's "
+                      "transmission, not the module. The wire is on the DIN net. "
+                      "Move it to the XBee's DOUT (pin 2).",
+                 pin, dev->cfg.tx_pin);
+    } else if (edges == 0) {
+        ESP_LOGW(TAG, "  verdict: LINE NEVER MOVED -- GPIO%d sat high while the "
+                      "module was answering. Whatever is on GPIO%d idles high but "
+                      "is not the module's DOUT. Trace the wire to XBee pin 2.",
+                 pin, pin);
+    } else if (total == 0) {
+        ESP_LOGW(TAG, "  verdict: EDGES BUT NO BYTES -- the line toggles and the "
+                      "UART hears none of it. Our side: UART RX routing or baud.");
+    } else {
+        ESP_LOGW(TAG, "  verdict: bytes arrived but no ATAP answer -- check the "
+                      "baud estimate above against %d.", dev->cfg.baud_rate);
+    }
+}
+#endif /* XBEE_RX_ACTIVITY_MS */
+
 /* Reset, verify, and only escape if verification failed. */
 static void xbee_bringup(struct telemetry_dev *dev)
 {
     uint32_t version = 0;
+
+#if XBEE_RAW_DUMP_MS > 0
+    /* We have not written a single byte yet, so anything here is the
+     * module talking entirely on its own. */
+    xbee_dump_raw(dev, "power-on, we are silent");
+#endif
 
     /* Discard whatever the module said while the UART was coming up --
      * a bootloader banner, or nothing. Either way it is not a frame and
@@ -605,6 +950,18 @@ static void xbee_bringup(struct telemetry_dev *dev)
     xbee_parser_reset(&dev->parser);
 
     xbee_hard_reset(dev);
+
+#if XBEE_RAW_DUMP_MS > 0
+    /* Same again, but after a clean reset with DIN already idling high.
+     * If this one is ASCII, the module boots into its bootloader. */
+    xbee_dump_raw(dev, "after hard reset");
+#endif
+
+#if XBEE_RX_ACTIVITY_MS > 0
+    /* The module has booted; now ask it something and watch GPIO4. */
+    xbee_rx_activity_test(dev);
+#endif
+
     uart_flush_input(dev->cfg.uart_port);
     xbee_parser_reset(&dev->parser);
 
@@ -648,11 +1005,186 @@ static void xbee_bringup(struct telemetry_dev *dev)
     event_log_error(ERR_SRC_TELEMETRY, ERR_CODE_INIT_FAILED, ESP_ERR_TIMEOUT, 0);
 }
 
+/* ===================================================================
+ *  TEMPORARY -- DIN contention test. Set XBEE_DIN_TEST_S to 0 to skip.
+ *
+ *  Answers one question with no extra hardware: when the ESP32 pulls
+ *  DIN low, does it actually GET low, or is something else on that net
+ *  holding it up?
+ *
+ *  A voltmeter alone cannot tell an actively-driven line from a weak
+ *  pull-up -- both read 3.3 V into a 10 Mohm meter. Driving the line and
+ *  measuring the result can, because a pull-up collapses under a real
+ *  driver and another push-pull output does not.
+ *
+ *  Runs before the UART claims GPIO3, and hands the pin back afterwards.
+ *
+ *  HOW TO USE: probe the EXPLORER's DIN pin (not the board side -- R10
+ *  is a 10k pull-up to 3V3 there and will read 3.3 V no matter what),
+ *  referenced to board ground. Read the voltage during each window.
+ *
+ *  What the LOW window means, against the XBee's VIL of 0.2 x VCC
+ *  (~0.66 V at 3.3 V):
+ *
+ *    below 0.3 V   clean. Nothing is fighting. Contention DISPROVEN --
+ *                  the fault is elsewhere (baud, AP setting, wiring).
+ *    0.3 - 0.66 V  something is pushing back, but the XBee can still
+ *                  read a zero. Marginal; fix it anyway.
+ *    above 0.66 V  the XBee CANNOT see this as a zero. Contention
+ *                  CONFIRMED -- get the module off the explorer.
+ *
+ *  The HIGH window is a sanity check: ~3.3 V confirms the wire is
+ *  intact and you are probing the right pin.
+ * =================================================================== */
+#define XBEE_DIN_TEST_S  0        /* seconds per window; 0 disables */
+
+#if XBEE_DIN_TEST_S > 0
+static void xbee_din_contention_test(int tx_pin)
+{
+    const gpio_config_t io = {
+        .pin_bit_mask = 1ULL << tx_pin,
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    if (gpio_config(&io) != ESP_OK) {
+        ESP_LOGW(TAG, "DIN test: could not claim GPIO%d -- skipping", tx_pin);
+        return;
+    }
+
+    ESP_LOGW(TAG, "=== DIN contention test on GPIO%d ===", tx_pin);
+    ESP_LOGW(TAG, "Probe the EXPLORER's DIN pin against board ground.");
+
+    gpio_set_level(tx_pin, 1);
+    ESP_LOGW(TAG, ">>> DIN driven HIGH for %d s -- expect ~3.3 V", XBEE_DIN_TEST_S);
+    vTaskDelay(pdMS_TO_TICKS(XBEE_DIN_TEST_S * 1000));
+
+    gpio_set_level(tx_pin, 0);
+    ESP_LOGW(TAG, ">>> DIN driven LOW for %d s -- THIS IS THE READING THAT MATTERS",
+             XBEE_DIN_TEST_S);
+    vTaskDelay(pdMS_TO_TICKS(XBEE_DIN_TEST_S * 1000));
+
+    ESP_LOGW(TAG, "=== end DIN test ===");
+    ESP_LOGW(TAG, "  <0.30 V  clean -- nothing is fighting, contention disproven");
+    ESP_LOGW(TAG, "  <0.66 V  marginal -- XBee can still read a zero");
+    ESP_LOGW(TAG, "  >0.66 V  CONFIRMED -- XBee cannot read a zero here");
+
+    /* Hand the pin back high-impedance so uart_set_pin() starts clean.
+     * R10 holds DIN at the idle level in the gap. */
+    const gpio_config_t release = {
+        .pin_bit_mask = 1ULL << tx_pin,
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    (void)gpio_config(&release);
+}
+#endif /* XBEE_DIN_TEST_S */
+
+/* ===================================================================
+ *  TEMPORARY -- DOUT path test. Set XBEE_DOUT_TEST_MS to 0 to skip.
+ *
+ *  The mirror of the DIN test, and it answers the question that
+ *  measuring at the explorer's DOUT pin CANNOT: do the bytes the module
+ *  emits actually arrive at GPIO4? A meter on the module's pin proves
+ *  the module talks. It says nothing about the wire in between.
+ *
+ *  Method: park GPIO4 as an input with the internal pull-down on
+ *  (~45 kohm) and sample hard. The XBee's DOUT driver is tens of ohms, so
+ *  if it is connected it wins that contest every time. Then repeat with
+ *  the internal pull-up. A pin with nothing attached follows whichever
+ *  internal resistor is enabled, and that is the signature we are after.
+ *
+ *    pulldown sees HIGH   something external drives the line high.
+ *                         DOUT is connected. Path is GOOD.
+ *    neither sees anything the pin exactly follows the internal
+ *                         resistors -- NOTHING IS ATTACHED. Broken wire,
+ *                         wrong pin, or a dead GPIO4.
+ *    pullup sees LOW only something holds it low: a short to ground, or
+ *                         the module asserting a continuous break.
+ *
+ *  Runs before the UART claims GPIO4 and hands the pin back afterwards.
+ * =================================================================== */
+#define XBEE_DOUT_TEST_MS  200     /* per phase; 0 disables */
+
+#if XBEE_DOUT_TEST_MS > 0
+static uint32_t xbee_pin_watch(int pin, int want, int ms)
+{
+    uint32_t hits = 0, total = 0;
+    const int64_t deadline = esp_timer_get_time() + (int64_t)ms * 1000;
+    while (esp_timer_get_time() < deadline) {
+        total++;
+        if (gpio_get_level(pin) == want) { hits++; }
+    }
+    (void)total;
+    return hits;
+}
+
+static void xbee_dout_path_test(int rx_pin)
+{
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << rx_pin,
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    if (gpio_config(&io) != ESP_OK) {
+        ESP_LOGW(TAG, "DOUT test: could not claim GPIO%d -- skipping", rx_pin);
+        return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(5));
+    const uint32_t high_vs_pulldown = xbee_pin_watch(rx_pin, 1, XBEE_DOUT_TEST_MS);
+
+    io.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io.pull_up_en   = GPIO_PULLUP_ENABLE;
+    (void)gpio_config(&io);
+    vTaskDelay(pdMS_TO_TICKS(5));
+    const uint32_t low_vs_pullup = xbee_pin_watch(rx_pin, 0, XBEE_DOUT_TEST_MS);
+
+    ESP_LOGW(TAG, "=== DOUT path test on GPIO%d ===", rx_pin);
+    ESP_LOGW(TAG, "  highs seen against internal pull-down: %u",
+             (unsigned)high_vs_pulldown);
+    ESP_LOGW(TAG, "  lows  seen against internal pull-up  : %u",
+             (unsigned)low_vs_pullup);
+
+    if (high_vs_pulldown > 0) {
+        ESP_LOGW(TAG, "  verdict: DOUT IS CONNECTED -- something external "
+                      "drives GPIO%d high against the pull-down. The wire is "
+                      "good; if the UART still reads nothing, suspect baud.",
+                 rx_pin);
+    } else if (low_vs_pullup > 0) {
+        ESP_LOGW(TAG, "  verdict: line held LOW -- short to ground, or the "
+                      "module is asserting a continuous break. Not a normal "
+                      "idle UART, which sits HIGH.");
+    } else {
+        ESP_LOGW(TAG, "  verdict: NOTHING ATTACHED -- GPIO%d follows the "
+                      "internal resistors exactly. Broken wire, wrong pin at "
+                      "the explorer, or a dead GPIO. This is why every raw "
+                      "dump reads SILENT.", rx_pin);
+    }
+
+    io.pull_up_en = GPIO_PULLUP_DISABLE;
+    (void)gpio_config(&io);
+}
+#endif /* XBEE_DOUT_TEST_MS */
+
 esp_err_t telemetry_init(const telemetry_config_t *cfg, telemetry_handle_t *out)
 {
     if (!cfg || !out) {
         return ESP_ERR_INVALID_ARG;
     }
+
+#if XBEE_DIN_TEST_S > 0
+    /* Before the UART claims the pin. */
+    xbee_din_contention_test(cfg->tx_pin);
+#endif
+
+#if XBEE_DOUT_TEST_MS > 0
+    xbee_dout_path_test(cfg->rx_pin);
+#endif
 
     struct telemetry_dev *dev = NULL;
     portENTER_CRITICAL(&s_pool_lock);
@@ -834,6 +1366,31 @@ bool telemetry_take_ping_request(telemetry_handle_t dev)
     }
     dev->ping_requested = false;
     return true;
+}
+
+bool telemetry_take_sd_eject_request(telemetry_handle_t dev)
+{
+    if (!dev || !dev->sd_eject_requested) {
+        return false;
+    }
+    dev->sd_eject_requested = false;
+    return true;
+}
+
+bool telemetry_take_config_apply_request(telemetry_handle_t dev)
+{
+    if (!dev || !dev->config_apply_requested) {
+        return false;
+    }
+    dev->config_apply_requested = false;
+    return true;
+}
+
+void telemetry_set_uplink_hook(telemetry_handle_t dev, telemetry_uplink_hook_t hook)
+{
+    if (dev) {
+        dev->uplink_hook = hook;
+    }
 }
 
 void telemetry_get_diagnostics(telemetry_handle_t dev, telemetry_diag_t *out)

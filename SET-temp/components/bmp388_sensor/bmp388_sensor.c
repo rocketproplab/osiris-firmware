@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include "bmp388_sensor.h"
 
 #include <string.h>
@@ -9,6 +10,7 @@
 #include "data_router.h"
 #include "event_log.h"
 #include "flight_mode.h"
+#include "sensor_bus.h"
 
 static const char *TAG = "BMP388";
 
@@ -21,7 +23,6 @@ struct bmp388_dev {
     bool                in_use;
     bmp388_config_t     cfg;
 
-    spi_device_handle_t spi;
     struct bmp3_dev     bmp;       // Bosch's own device handle
     bool                initialized;
 
@@ -51,61 +52,40 @@ static struct bmp388_dev s_pool[BMP388_MAX_INSTANCES];
 static portMUX_TYPE      s_pool_lock = portMUX_INITIALIZER_UNLOCKED;
 
 /* ===================================================================
- *  SPI HAL callbacks for the Bosch driver
+ *  Bus callbacks for the Bosch driver
+ *
+ *  These are deliberately dumb pipes. bmp3.c already knows the BMP388's
+ *  SPI rules -- when dev.intf is BMP3_SPI_INTF it sets the read bit and
+ *  asks for one extra byte, then throws the dummy byte away itself. So the
+ *  read callback uses sensor_bus_raw_read(), which applies no rules. Using
+ *  sensor_bus_read() here would apply them a second time.
  * =================================================================== */
 
-static BMP3_INTF_RET_TYPE bmp388_spi_read(uint8_t reg_addr, uint8_t *data,
+static BMP3_INTF_RET_TYPE bmp388_bus_read(uint8_t reg_addr, uint8_t *data,
                                           uint32_t len, void *intf_ptr)
 {
-    bmp388_handle_t dev = (bmp388_handle_t)intf_ptr;
-
-    if (!dev || len > 32) {
+    if (!intf_ptr) {
         return BMP3_E_COMM_FAIL;
     }
-
-    uint8_t tx[34] = {0};
-    uint8_t rx[34] = {0};
-    tx[0] = reg_addr;   /* read bit (0x80) already set by bmp3.c */
-
-    spi_transaction_t t = {
-        .length   = (len + 1) * 8,
-        .rxlength = (len + 1) * 8,
-        .tx_buffer = tx,
-        .rx_buffer = rx,
-    };
-
-    esp_err_t err = spi_device_polling_transmit(dev->spi, &t);
+    esp_err_t err = sensor_bus_raw_read(SENSOR_BUS_BMP388, reg_addr, data, len);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "SPI read 0x%02X failed: %s", reg_addr, esp_err_to_name(err));
+        ESP_LOGE(TAG, "%s read 0x%02X failed: %s", sensor_bus_name(), reg_addr,
+                 esp_err_to_name(err));
         return BMP3_E_COMM_FAIL;
     }
-
-    /* rx[0] is garbage clocked in while we were sending the address byte */
-    memcpy(data, &rx[1], len);
     return BMP3_INTF_RET_SUCCESS;
 }
 
-static BMP3_INTF_RET_TYPE bmp388_spi_write(uint8_t reg_addr, const uint8_t *data,
+static BMP3_INTF_RET_TYPE bmp388_bus_write(uint8_t reg_addr, const uint8_t *data,
                                            uint32_t len, void *intf_ptr)
 {
-    bmp388_handle_t dev = (bmp388_handle_t)intf_ptr;
-
-    if (!dev || len > 32) {
+    if (!intf_ptr) {
         return BMP3_E_COMM_FAIL;
     }
-
-    uint8_t tx[33];
-    tx[0] = reg_addr;   /* bmp3.c already masked off the read bit */
-    memcpy(&tx[1], data, len);
-
-    spi_transaction_t t = {
-        .length    = (len + 1) * 8,
-        .tx_buffer = tx,
-    };
-
-    esp_err_t err = spi_device_polling_transmit(dev->spi, &t);
+    esp_err_t err = sensor_bus_write(SENSOR_BUS_BMP388, reg_addr, data, len);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "SPI write 0x%02X failed: %s", reg_addr, esp_err_to_name(err));
+        ESP_LOGE(TAG, "%s write 0x%02X failed: %s", sensor_bus_name(), reg_addr,
+                 esp_err_to_name(err));
         return BMP3_E_COMM_FAIL;
     }
     return BMP3_INTF_RET_SUCCESS;
@@ -153,15 +133,29 @@ static void IRAM_ATTR bmp388_isr(void *arg)
 static void bmp388_task(void *arg)
 {
     bmp388_handle_t dev = (bmp388_handle_t)arg;
-    const TickType_t timeout = pdMS_TO_TICKS(BMP388_IRQ_TIMEOUT_MS);
 
     ESP_LOGI(TAG, "reader task running on core %d", (int)xPortGetCoreID());
 
     for (;;) {
+        /* Timeout follows the CURRENT rate, re-evaluated every pass. */
+        const TickType_t timeout = pdMS_TO_TICKS(dev->fast ? BMP388_IRQ_TIMEOUT_MS
+                                                           : BMP388_IRQ_TIMEOUT_SLOW_MS);
         uint32_t notified = ulTaskNotifyTake(pdTRUE, timeout);
 
-        /* Reconfigure from the task that owns the SPI device, never from
-         * whichever task changed the mode. */
+        /* Clear the latched INT before anything else. The pin is
+         * configured BMP3_INT_PIN_LATCH: after a DRDY it stays HIGH until
+         * INT_STATUS (0x11) is read. Reading the data registers does NOT
+         * clear it. Without this read the pin sat high after the first
+         * sample, no further rising edge ever reached the ISR, and every
+         * sample after that came from the timeout path -- 10 Hz in
+         * flight instead of 50, and IRQ_TIMEOUT errors in the log.
+         * Cleared first, not last: a DRDY landing while we read the data
+         * then produces a fresh edge instead of being wiped out. */
+        uint8_t int_status = 0;
+        (void)bmp3_get_regs(BMP3_REG_INT_STATUS, &int_status, 1, &dev->bmp);
+
+        /* Reconfigure from this sensor's own task, never from whichever
+         * task changed the mode -- dev->bmp is not safe to share. */
         bool want_fast = flight_mode_is_fast();
         if (want_fast != dev->fast) {
             bmp388_set_rate(dev, want_fast);
@@ -340,14 +334,11 @@ static esp_err_t bmp388_setup_interrupt(bmp388_handle_t dev)
         return err;
     }
 
-    err = gpio_isr_handler_add(dev->cfg.int_pin, bmp388_isr, (void *)dev);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "gpio_isr_handler_add failed: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    dev->isr_installed = true;
-    ESP_LOGI(TAG, "INT armed on GPIO%d (rising edge)", (int)dev->cfg.int_pin);
+    /* The handler itself is attached in bmp388_start(), AFTER the reader
+     * task exists. bmp388_isr() calls vTaskNotifyGiveFromISR(dev->task);
+     * attaching it here meant the first DRDY edge (the chip is already
+     * in NORMAL mode by now) notified a NULL task and tripped the
+     * FreeRTOS assert in vTaskGenericNotifyGiveFromISR. */
     return ESP_OK;
 }
 
@@ -395,51 +386,37 @@ esp_err_t bmp388_init(const bmp388_config_t *cfg, bmp388_handle_t *out)
         dev->cfg.ref_pressure_pa = 101325.0f;
     }
 
-    spi_device_interface_config_t devcfg = {
-        .mode           = 0,
-        .clock_speed_hz = cfg->spi_freq_hz,
-        .spics_io_num   = cfg->cs_pin,
-        .queue_size     = 1,
-    };
-
-    esp_err_t err = spi_bus_add_device(cfg->host, &devcfg, &dev->spi);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "spi_bus_add_device failed: %s", esp_err_to_name(err));
-        dev->in_use = false;
-        return err;
-    }
-
-    dev->bmp.intf     = BMP3_SPI_INTF;
-    dev->bmp.intf_ptr = dev;    /* callbacks find this exact instance */
-    dev->bmp.read     = bmp388_spi_read;
-    dev->bmp.write    = bmp388_spi_write;
+    /* No bus setup here: sensor_bus_init() already did it. Tell Bosch's
+     * driver which bus it is on, because its SPI and I2C framing differ. */
+    dev->bmp.intf     = sensor_bus_is_spi() ? BMP3_SPI_INTF : BMP3_I2C_INTF;
+    dev->bmp.intf_ptr = dev;    /* bmp3_init() rejects a NULL intf_ptr */
+    dev->bmp.read     = bmp388_bus_read;
+    dev->bmp.write    = bmp388_bus_write;
     dev->bmp.delay_us = bmp388_delay_us;
 
     int8_t rslt = bmp3_init(&dev->bmp);
     if (rslt != BMP3_OK) {
-        ESP_LOGE(TAG, "bmp3_init failed (%d) -- check MISO/MOSI/CS wiring", rslt);
-        spi_bus_remove_device(dev->spi);
+        ESP_LOGE(TAG, "bmp3_init failed (%d) over %s -- see sensor_bus's "
+                      "chip-ID line above", rslt, sensor_bus_name());
         dev->in_use = false;
         return ESP_FAIL;
     }
     ESP_LOGI(TAG, "BMP388/390 found, chip ID 0x%02X", dev->bmp.chip_id);
 
     if (bmp388_configure_sensor(dev) != ESP_OK) {
-        spi_bus_remove_device(dev->spi);
         dev->in_use = false;
         return ESP_FAIL;
     }
 
-    err = bmp388_setup_interrupt(dev);
+    esp_err_t err = bmp388_setup_interrupt(dev);
     if (err != ESP_OK) {
-        spi_bus_remove_device(dev->spi);
         dev->in_use = false;
         return err;
     }
 
     dev->initialized = true;
     *out = dev;
-    ESP_LOGI(TAG, "BMP388 initialized (SPI, interrupt-driven)");
+    ESP_LOGI(TAG, "BMP388 initialized (%s, interrupt-driven)", sensor_bus_name());
     return ESP_OK;
 }
 
@@ -462,6 +439,19 @@ esp_err_t bmp388_start(bmp388_handle_t dev, UBaseType_t priority, BaseType_t cor
         return ESP_FAIL;
     }
 
+    /* Task before ISR handler, not after -- same rule as discrete_in. */
+    esp_err_t err = gpio_isr_handler_add(dev->cfg.int_pin, bmp388_isr, (void *)dev);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "gpio_isr_handler_add failed: %s", esp_err_to_name(err));
+        vTaskDelete(dev->task);
+        dev->task = NULL;
+        return err;
+    }
+    dev->isr_installed = true;
+    ESP_LOGI(TAG, "INT armed on GPIO%d (rising edge)", (int)dev->cfg.int_pin);
+
+    /* Read status AFTER the handler is attached: clears the latched INT
+     * so the next DRDY produces a fresh rising edge that we will catch. */
     struct bmp3_status status;
     (void)bmp3_get_status(&status, &dev->bmp);
 
@@ -482,11 +472,6 @@ esp_err_t bmp388_stop(bmp388_handle_t dev)
         vTaskDelete(dev->task);
         dev->task = NULL;
     }
-    if (dev->spi) {
-        spi_bus_remove_device(dev->spi);
-        dev->spi = NULL;
-    }
-
     dev->initialized = false;
     dev->in_use      = false;
     return ESP_OK;
@@ -510,7 +495,17 @@ esp_err_t bmp388_wait_for_sample(bmp388_handle_t dev, uint32_t last_seq,
     }
 
     const TickType_t start = xTaskGetTickCount();
-    const TickType_t poll  = pdMS_TO_TICKS(1);
+    /* At least one tick, always. pdMS_TO_TICKS(1) is integer division by
+     * the tick rate, so it rounds DOWN to ZERO at any tick rate below
+     * 1000 Hz -- and vTaskDelay(0) does not block. It yields, and a yield
+     * only runs tasks of equal or higher priority, never the idle task.
+     * The result is this core pegged at 100% and the task watchdog
+     * tripping on IDLE. Clamping here means no sdkconfig change can bring
+     * that back. */
+    TickType_t poll = pdMS_TO_TICKS(1);
+    if (poll == 0) {
+        poll = 1;
+    }
 
     for (;;) {
         bmp388_get_latest(dev, out);

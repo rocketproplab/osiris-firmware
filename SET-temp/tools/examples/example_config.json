@@ -1,0 +1,24 @@
+{
+  "channels": {
+    "Apo": {
+      "primary": { "APOGEE": true },
+      "secondary": { "TVAL2": true },
+      "thresholds": { "TVAL2": 30.0 },
+      "latch": true,
+      "delay_ms": 0,
+      "manual_arm": false
+    },
+    "Main": {
+      "primary": { "AGL1": true, "BVEL1": true, "APOFIRED": true },
+      "secondary": {},
+      "thresholds": { "AGL1": 500.0, "BVEL1": 0.0 },
+      "latch": true,
+      "delay_ms": 500,
+      "manual_arm": false
+    },
+    "3rd":  { "primary": {}, "secondary": {}, "thresholds": {},
+              "latch": false, "delay_ms": 1500, "manual_arm": false },
+    "4th":  { "primary": {}, "secondary": {}, "thresholds": {},
+              "latch": false, "delay_ms": 1500, "manual_arm": false }
+  }
+}

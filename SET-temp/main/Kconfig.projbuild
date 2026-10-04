@@ -127,3 +127,108 @@ config FC_DISCRETE_ISR_LEVEL
         sensor DRDY handlers.
 
 endmenu
+
+menu "Flight Computer SD Card Policy"
+
+config FC_SD_AUTO_EJECT_S
+    int "Unmount the SD card after this many seconds of uptime (0 = never)"
+    range 0 604800
+    default 21600
+    help
+        A vehicle left powered on the pad otherwise sits with a mounted
+        card until somebody sends EJECT SD or pulls the battery, and
+        pulling the battery on a mounted FAT filesystem is exactly what
+        the eject path exists to avoid.
+
+        The default is 21600 (6 hours), comfortably longer than a range
+        day and far shorter than leaving it powered overnight.
+
+        The deadline is DEFERRED, never enforced, while the vehicle is
+        ARMED or in FLIGHT -- the same gate the uplink EJECT SD command
+        uses. A pad hold that runs long and then launches cannot lose
+        the flight to this timer; the unmount waits until the vehicle is
+        back in STANDBY or LANDED.
+
+        Set 0 to disable the timer and keep the card mounted until an
+        uplink eject or power down.
+
+        NOTE: tools/ground_station.py shows a countdown derived from
+        this value and keeps its own copy of it. Change one and change
+        the other, or the countdown will be wrong.
+
+endmenu
+
+menu "Flight Computer Optional Subsystems"
+
+config FC_ENABLE_DISCRETE_IN
+    bool "Watch the Blue Raven staging / recovery discrete inputs"
+    default y
+    help
+        ON for flight. This is the board's independent record of when
+        the Blue Raven actually fired -- the whole reason the J7/J8
+        dividers exist, and half of the point of laying this vehicle's
+        timeline next to the Blue Raven's afterwards.
+
+        Turning it OFF is a BENCH convenience, for working on telemetry
+        or flight logic without two floating inputs generating thousands
+        of spurious edges a second. Nothing else depends on these
+        handles -- discrete_in_fired() is never called and flight_logic
+        never reads them, so they are pure observers and disabling them
+        cannot change what any other subsystem does.
+
+        Try DISCRETE_IN_INTERNAL_PULLDOWN first. That keeps the feature
+        and fixes the same bench problem, and is the option you want
+        unless you specifically need these two tasks gone.
+
+        A build with this OFF logs a loud warning on every boot, because
+        a flight computer that silently stopped watching its deployment
+        signals is exactly the kind of thing that gets discovered after
+        the flight.
+
+endmenu
+
+menu "Flight Computer Operating Mode"
+
+choice FC_OPERATING_MODE
+    prompt "Operating mode"
+    default FC_MODE_FLIGHT
+    help
+        FLIGHT is the real thing and the default. Every other option on
+        this page only exists when TEST is selected.
+
+config FC_MODE_FLIGHT
+    bool "Flight"
+    help
+        Normal behaviour. Boots in STANDBY; the mode changes only on an
+        uplink ARM/DISARM or a detected liftoff/landing.
+
+config FC_MODE_TEST
+    bool "Test (scripted STANDBY/FLIGHT cycle) -- NOT FOR FLIGHT"
+    help
+        Bench testing of everything that keys on the flight mode --
+        sensor rate switching, gyro power-up, telemetry rates, the
+        ground station's mode display -- without shaking the board.
+
+        Boots in STANDBY, then forces, one step every FC_TEST_STEP_S
+        seconds:
+
+            STANDBY -> FLIGHT -> STANDBY -> FLIGHT -> STANDBY (stays)
+
+        Every forced change is recorded in event.bin as MODE_CHANGED
+        with source TEST, so a log from a test build cannot be mistaken
+        for a flight. The flight_logic estimator is NOT told about
+        liftoff -- deployment channels stay quiet -- and the uplink and
+        IMU paths keep working as normal throughout.
+
+        The forced FLIGHT -> STANDBY step is the one thing a flight
+        build can never do. It does not exist in a FLIGHT build at all.
+
+endchoice
+
+config FC_TEST_STEP_S
+    int "Seconds per step of the test sequence"
+    depends on FC_MODE_TEST
+    range 1 600
+    default 5
+
+endmenu

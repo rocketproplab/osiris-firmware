@@ -5,7 +5,6 @@
 #include <stdbool.h>
 
 #include "esp_err.h"
-#include "driver/spi_master.h"
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -42,13 +41,12 @@ typedef struct {
     uint32_t count;         // edges seen; >1 means the latch was re-armed
 } lsm6dsox_liftoff_t;
 
+/* No bus fields: which bus, which pins and what clock are decided by
+ * sensor_bus (menuconfig -> SET sensor bus). */
 typedef struct {
-    spi_host_device_t host;
-    gpio_num_t        cs_pin;
     gpio_num_t        int_pin;  // wired to LSM6DSOX INT1 (data-ready)
     gpio_num_t        int2_pin; // wired to LSM6DSOX INT2 (wake-up / liftoff).
                                  // GPIO_NUM_NC disables the whole feature.
-    uint32_t          spi_freq_hz;
 
     /* Wake-up tuning. 0 means "use the LSM6DSOX_LIFTOFF_* default". */
     float             liftoff_threshold_g;
@@ -81,9 +79,8 @@ typedef struct lsm6dsox_dev *lsm6dsox_handle_t;
  *  Lifecycle
  * =================================================================== */
 
-/* Claims a slot from the static pool, adds the LSM6DSOX as a device on
- * the given SPI bus (already initialized by the caller), and configures
- * it: WHO_AM_I check, software reset, BDU, I3C disable, accel/gyro
+/* Claims a slot from the static pool and configures the LSM6DSOX over
+ * sensor_bus (call sensor_bus_init() first): WHO_AM_I check, software reset, BDU, I3C disable, accel/gyro
  * ODR + range, INT1 routed to data-ready. Does not start the reader
  * task yet. On success, *out is a handle for every other call to use. */
 esp_err_t lsm6dsox_init(const lsm6dsox_config_t *cfg, lsm6dsox_handle_t *out);
@@ -124,8 +121,8 @@ void lsm6dsox_get_diagnostics(lsm6dsox_handle_t dev, lsm6dsox_diag_t *out);
  * not a reading. Cross-reference EV_MODE_CHANGED in event.bin to see
  * which samples were taken with the gyro off.
  *
- * MUST be called from the task that owns the SPI device -- it issues bus
- * transactions. lsm6dsox_task() does this itself by watching
+ * MUST be called from this sensor's own task -- it rewrites chip
+ * registers that task relies on. lsm6dsox_task() does this itself by watching
  * flight_mode; nothing else should call it. */
 esp_err_t lsm6dsox_set_rate(lsm6dsox_handle_t dev, bool fast);
 

@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include "lsm6dsox_sensor.h"
 
 #include <string.h>
@@ -8,6 +9,7 @@
 #include "data_router.h"
 #include "event_log.h"
 #include "flight_mode.h"
+#include "sensor_bus.h"
 
 static const char *TAG = "LSM6DSOX";
 
@@ -21,6 +23,7 @@ static const char *TAG = "LSM6DSOX";
 #define LSM6DSOX_CTRL2_G        0x11    // Gyroscope control
 #define LSM6DSOX_CTRL3_C        0x12    // Control register 3 (SW_RESET, BDU)
 #define LSM6DSOX_CTRL9_XL       0x18    // Control register 9 (I3C disable)
+#define LSM6DSOX_CTRL9_I3C_DISABLE 0x02 // bit 1. Bit 0 is not-used and must stay 0.
 #define LSM6DSOX_INT1_CTRL      0x0D    // Routes DRDY_XL / DRDY_G to INT1
 #define LSM6DSOX_OUTX_L_G       0x22    // Gyro output start
 #define LSM6DSOX_OUTX_L_A       0x28    // Accel output start
@@ -65,12 +68,14 @@ static const char *TAG = "LSM6DSOX";
  * FS_XL/64; at +/-16 g that is 0.25 g per count. */
 #define WAKE_THS_LSB_G          (16.0f / 64.0f)
 
-/* SPI framing bits, ST convention:
- *   bit7 = R/W  (1 = read, 0 = write)
- *   bit6 = MS   (auto-increment; must be set for any transfer >1 byte)
- * No dummy byte here -- that was BMP388-specific. */
-#define LSM6DSOX_SPI_READ_BIT   0x80
-#define LSM6DSOX_SPI_MS_BIT     0x40
+/* Bus framing lives in sensor_bus, not here. For the record, because it
+ * was wrong here before: on the LSM6DSOX the SPI address byte is bit7 = R/W
+ * and bits 6..0 = the register address. There is NO "MS" auto-increment bit
+ * -- that is the convention of older ST parts (LIS3MDL, L3GD20). On this
+ * chip bit 6 is part of the address (TAP_CFG0 at 0x56 needs it), and
+ * auto-increment is CTRL3_C IF_INC, which is on by default. Setting 0x40 on
+ * a gyro read turned 0x22 into 0x62 (I3C_BUS_AVB) and the accel read 0x28
+ * into 0x68 (unused), so every sample came from the wrong registers. */
 
 /* ===================================================================
  *  The real struct -- private to this file, same idiom as bmp388_dev.
@@ -82,7 +87,6 @@ struct lsm6dsox_dev {
     bool                in_use;
     lsm6dsox_config_t   cfg;
 
-    spi_device_handle_t spi;
     bool                initialized;
 
     lsm6_data_t         latest;
@@ -113,56 +117,32 @@ static struct lsm6dsox_dev s_pool[LSM6DSOX_MAX_INSTANCES];
 static portMUX_TYPE        s_pool_lock = portMUX_INITIALIZER_UNLOCKED;
 
 /* ===================================================================
- *  SPI primitives -- now take dev explicitly instead of reaching for a
- *  fixed global SPI handle.
+ *  Register access -- through sensor_bus, so the same two functions work
+ *  whether the build is SPI or I2C. The bus layer adds the SPI read bit;
+ *  pass plain register addresses here.
  * =================================================================== */
 
 static esp_err_t lsm6dsox_read_regs(lsm6dsox_handle_t dev, uint8_t reg,
                                     uint8_t *dst, size_t len)
 {
-    if (!dev || !dst || len == 0 || len > 32) {
+    if (!dev || !dst || len == 0) {
         return ESP_ERR_INVALID_ARG;
     }
-
-    uint8_t addr = reg | LSM6DSOX_SPI_READ_BIT;
-    if (len > 1) {
-        addr |= LSM6DSOX_SPI_MS_BIT;
-    }
-
-    uint8_t tx[33] = {0};
-    uint8_t rx[33] = {0};
-    tx[0] = addr;
-
-    spi_transaction_t t = {
-        .length    = (len + 1) * 8,
-        .rxlength  = (len + 1) * 8,
-        .tx_buffer = tx,
-        .rx_buffer = rx,
-    };
-
-    esp_err_t err = spi_device_polling_transmit(dev->spi, &t);
+    esp_err_t err = sensor_bus_read(SENSOR_BUS_LSM6DSOX, reg, dst, len);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "SPI read 0x%02X failed: %s", reg, esp_err_to_name(err));
-        return err;
+        ESP_LOGE(TAG, "%s read 0x%02X failed: %s", sensor_bus_name(), reg,
+                 esp_err_to_name(err));
     }
-
-    /* No dummy byte to skip here -- rx[0] is the only garbage byte. */
-    memcpy(dst, &rx[1], len);
-    return ESP_OK;
+    return err;
 }
 
 static esp_err_t lsm6dsox_write_reg(lsm6dsox_handle_t dev, uint8_t reg, uint8_t val)
 {
-    uint8_t tx[2] = { (uint8_t)(reg & 0x7F), val };
-
-    spi_transaction_t t = {
-        .length    = 16,
-        .tx_buffer = tx,
-    };
-
-    esp_err_t err = spi_device_polling_transmit(dev->spi, &t);
+    (void)dev;
+    esp_err_t err = sensor_bus_write(SENSOR_BUS_LSM6DSOX, reg, &val, 1);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "SPI write 0x%02X failed: %s", reg, esp_err_to_name(err));
+        ESP_LOGE(TAG, "%s write 0x%02X failed: %s", sensor_bus_name(), reg,
+                 esp_err_to_name(err));
     }
     return err;
 }
@@ -197,10 +177,12 @@ static void lsm6dsox_task(void *arg)
     for (;;) {
         uint32_t notified = ulTaskNotifyTake(pdTRUE, timeout);
 
-        /* Reconfiguration happens HERE, in the task that owns the SPI
-         * device -- never from whatever task changed the mode. The
-         * telemetry task accepting an ARM command must not reach into
-         * this sensor's bus. Polling costs one comparison per sample. */
+        /* Reconfiguration happens HERE, in this sensor's own task --
+         * never from whatever task changed the mode. The telemetry task
+         * accepting an ARM command must not reach into this sensor. (The
+         * bus itself is locked by sensor_bus; this rule keeps `dev->fast`
+         * and the chip's registers owned by one task.) Polling costs one
+         * comparison per sample. */
         /* The hardware liftoff latch is the backup path into FLIGHT --
          * it is what makes the vehicle switch to flight rates even if
          * the radio never worked. Called from the task, not the ISR:
@@ -282,7 +264,7 @@ static void lsm6dsox_task(void *arg)
 }
 
 /* INT2 ISR. The wake-up event is latched in the sensor, so this fires
- * once and then the line stays high. No SPI here -- reading WAKE_UP_SRC
+ * once and then the line stays high. No bus access here -- reading WAKE_UP_SRC
  * to learn which axis tripped would mean a bus transaction from
  * interrupt context, and the axis is not worth that. */
 static void IRAM_ATTR lsm6dsox_liftoff_isr(void *arg)
@@ -386,9 +368,17 @@ static esp_err_t lsm6dsox_configure_sensor(lsm6dsox_handle_t dev)
 
     lsm6dsox_write_reg(dev, LSM6DSOX_CTRL3_C, 0x01);
 
+    /* Same pdMS_TO_TICKS(1)-rounds-to-zero trap as in
+     * lsm6dsox_wait_for_sample(): without this clamp the loop spun 100
+     * times with no delay at all, so "software reset complete" could be
+     * logged before the chip had actually finished resetting. */
+    TickType_t reset_poll = pdMS_TO_TICKS(1);
+    if (reset_poll == 0) {
+        reset_poll = 1;
+    }
     uint8_t ctrl3 = 0x01;
     for (int i = 0; i < 100 && (ctrl3 & 0x01); i++) {
-        vTaskDelay(pdMS_TO_TICKS(1));
+        vTaskDelay(reset_poll);
         lsm6dsox_read_regs(dev, LSM6DSOX_CTRL3_C, &ctrl3, 1);
     }
     if (ctrl3 & 0x01) {
@@ -397,12 +387,21 @@ static esp_err_t lsm6dsox_configure_sensor(lsm6dsox_handle_t dev)
     }
     ESP_LOGI(TAG, "software reset complete");
 
+    /* The reset put CTRL4_C back to defaults, which on an SPI build
+     * re-enables the chip's I2C listener. sensor_bus turns it back off
+     * (no-op on an I2C build). */
+    err = sensor_bus_harden();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "sensor_bus_harden after reset failed: %s", esp_err_to_name(err));
+    }
+
     lsm6dsox_read_regs(dev, LSM6DSOX_CTRL3_C, &ctrl3, 1);
     lsm6dsox_write_reg(dev, LSM6DSOX_CTRL3_C, ctrl3 | 0x40);
 
     uint8_t ctrl9 = 0;
     lsm6dsox_read_regs(dev, LSM6DSOX_CTRL9_XL, &ctrl9, 1);
-    lsm6dsox_write_reg(dev, LSM6DSOX_CTRL9_XL, ctrl9 | 0x01);
+    lsm6dsox_write_reg(dev, LSM6DSOX_CTRL9_XL,
+                       (uint8_t)((ctrl9 | LSM6DSOX_CTRL9_I3C_DISABLE) & ~0x01));
 
     err = lsm6dsox_write_reg(dev, LSM6DSOX_CTRL1_XL, LSM6DSOX_CTRL1_XL_VAL);
     if (err != ESP_OK) { ESP_LOGE(TAG, "CTRL1_XL write failed"); return err; }
@@ -449,14 +448,9 @@ static esp_err_t lsm6dsox_setup_interrupt(lsm6dsox_handle_t dev)
         return err;
     }
 
-    err = gpio_isr_handler_add(dev->cfg.int_pin, lsm6dsox_isr, (void *)dev);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "gpio_isr_handler_add failed: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    dev->isr_installed = true;
-    ESP_LOGI(TAG, "INT1 armed on GPIO%d (rising edge)", (int)dev->cfg.int_pin);
+    /* INT1's handler is attached in lsm6dsox_start(), AFTER the reader
+     * task exists -- lsm6dsox_isr() notifies dev->task, which is NULL
+     * until then. INT2 (liftoff) stays here: its ISR only sets a flag. */
 
     if (dev->cfg.int2_pin != GPIO_NUM_NC) {
         gpio_config_t io2 = {
@@ -521,37 +515,23 @@ esp_err_t lsm6dsox_init(const lsm6dsox_config_t *cfg, lsm6dsox_handle_t *out)
 
     dev->cfg = *cfg;   /* shallow copy -- cfg can die after this call returns */
 
-    spi_device_interface_config_t devcfg = {
-        .mode           = 0,
-        .clock_speed_hz = cfg->spi_freq_hz,
-        .spics_io_num   = cfg->cs_pin,
-        .queue_size     = 1,
-    };
-
-    esp_err_t err = spi_bus_add_device(cfg->host, &devcfg, &dev->spi);
+    /* No bus setup here: sensor_bus_init() already did it, for whichever
+     * bus this build uses. */
+    esp_err_t err = lsm6dsox_configure_sensor(dev);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "spi_bus_add_device failed: %s", esp_err_to_name(err));
-        dev->in_use = false;
-        return err;
-    }
-
-    err = lsm6dsox_configure_sensor(dev);
-    if (err != ESP_OK) {
-        spi_bus_remove_device(dev->spi);
         dev->in_use = false;
         return err;
     }
 
     err = lsm6dsox_setup_interrupt(dev);
     if (err != ESP_OK) {
-        spi_bus_remove_device(dev->spi);
         dev->in_use = false;
         return err;
     }
 
     dev->initialized = true;
     *out = dev;
-    ESP_LOGI(TAG, "LSM6DSOX initialized (SPI, interrupt-driven)");
+    ESP_LOGI(TAG, "LSM6DSOX initialized (%s, interrupt-driven)", sensor_bus_name());
     return ESP_OK;
 }
 
@@ -574,6 +554,17 @@ esp_err_t lsm6dsox_start(lsm6dsox_handle_t dev, UBaseType_t priority, BaseType_t
         return ESP_FAIL;
     }
 
+    /* Task before ISR handler, not after -- same rule as discrete_in. */
+    esp_err_t err = gpio_isr_handler_add(dev->cfg.int_pin, lsm6dsox_isr, (void *)dev);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "gpio_isr_handler_add failed: %s", esp_err_to_name(err));
+        vTaskDelete(dev->task);
+        dev->task = NULL;
+        return err;
+    }
+    dev->isr_installed = true;
+    ESP_LOGI(TAG, "INT1 armed on GPIO%d (rising edge)", (int)dev->cfg.int_pin);
+
     return ESP_OK;
 }
 
@@ -595,11 +586,6 @@ esp_err_t lsm6dsox_stop(lsm6dsox_handle_t dev)
         vTaskDelete(dev->task);
         dev->task = NULL;
     }
-    if (dev->spi) {
-        spi_bus_remove_device(dev->spi);
-        dev->spi = NULL;
-    }
-
     dev->initialized = false;
     dev->in_use      = false;
     return ESP_OK;
@@ -623,7 +609,17 @@ esp_err_t lsm6dsox_wait_for_sample(lsm6dsox_handle_t dev, uint32_t last_seq,
     }
 
     const TickType_t start = xTaskGetTickCount();
-    const TickType_t poll  = pdMS_TO_TICKS(1);
+    /* At least one tick, always. pdMS_TO_TICKS(1) is integer division by
+     * the tick rate, so it rounds DOWN to ZERO at any tick rate below
+     * 1000 Hz -- and vTaskDelay(0) does not block. It yields, and a yield
+     * only runs tasks of equal or higher priority, never the idle task.
+     * The result is this core pegged at 100% and the task watchdog
+     * tripping on IDLE. Clamping here means no sdkconfig change can bring
+     * that back. */
+    TickType_t poll = pdMS_TO_TICKS(1);
+    if (poll == 0) {
+        poll = 1;
+    }
 
     for (;;) {
         lsm6dsox_get_latest(dev, out);

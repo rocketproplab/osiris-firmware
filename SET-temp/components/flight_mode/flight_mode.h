@@ -96,6 +96,13 @@ bool flight_mode_note_liftoff(mode_source_t src);
  * NOT change any sensor rate -- see the note above. */
 bool flight_mode_note_landed(mode_source_t src);
 
+/* TEST BUILDS ONLY (menuconfig: Flight Computer Operating Mode -> Test).
+ * Moves to `to` unconditionally -- including out of FLIGHT, which no
+ * other path may do -- and records it as MODE_SRC_TEST. In a flight
+ * build the body is compiled out: it refuses, logs, and returns false,
+ * so the rule above cannot be bypassed by a stray call. */
+bool flight_mode_test_force(flight_mode_t to);
+
 void flight_mode_get_diagnostics(flight_mode_diag_t *out);
 
 /* "STANDBY" / "ARMED" / "FLIGHT" / "LANDED", for log lines. */

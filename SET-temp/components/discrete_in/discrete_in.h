@@ -125,9 +125,40 @@ typedef struct {
 } discrete_in_config_t;
 
 typedef struct {
-    uint32_t triggers;         // edges seen on this channel
+    uint32_t triggers;         // edges ACCEPTED on this channel
+    uint32_t suppressed;       // edges rejected by the minimum-interval
+                                // filter below. Non-zero means the line
+                                // is chattering: noise, a bouncing
+                                // contact, or a floating pin. Worth
+                                // reading in a flight review even
+                                // though nothing was lost.
     uint64_t first_trigger_us; // ISR-captured time of the FIRST edge
 } discrete_in_diag_t;
+
+/* ===================================================================
+ *  Minimum interval between accepted edges.
+ *
+ *  These tasks run at the HIGHEST priority in the system and each
+ *  accepted edge writes a console line and pushes an event to the card
+ *  and the downlink. Without a floor on the edge rate, a chattering
+ *  input starves every task below it -- which on this board is every
+ *  task, including the sensor readers.
+ *
+ *  That is not theoretical. A floating GPIO23 on a breadboard produced
+ *  roughly 6700 edges a second and the visible symptom was
+ *  ESP_ERR_TIMEOUT on I2C sensor reads: a starvation fault wearing a
+ *  bus fault's clothes.
+ *
+ *  The filter lives in the ISR, not the task, so a suppressed edge
+ *  costs nothing beyond the ISR entry -- no notify, no wake, no log.
+ *  The FIRST edge is always accepted with its exact ISR timestamp.
+ * =================================================================== */
+#ifdef CONFIG_DISCRETE_IN_MIN_INTERVAL_MS
+#define DISCRETE_IN_MIN_INTERVAL_MS   CONFIG_DISCRETE_IN_MIN_INTERVAL_MS
+#else
+#define DISCRETE_IN_MIN_INTERVAL_MS   50
+#endif
+#define DISCRETE_IN_MIN_INTERVAL_US   ((uint64_t)DISCRETE_IN_MIN_INTERVAL_MS * 1000ULL)
 
 typedef struct discrete_in_dev *discrete_in_handle_t;
 

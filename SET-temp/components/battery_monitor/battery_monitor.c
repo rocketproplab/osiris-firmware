@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include "battery_monitor.h"
 
 #include <string.h>

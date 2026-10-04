@@ -5,7 +5,6 @@
 #include <stdbool.h>
 
 #include "esp_err.h"
-#include "driver/spi_master.h"
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -14,7 +13,11 @@
 
 #define BMP388_MAX_INSTANCES    1
 #define BMP388_STACK_WORDS      3072
-#define BMP388_IRQ_TIMEOUT_MS   100   /* fallback poll period if INT stalls */
+#define BMP388_IRQ_TIMEOUT_MS   100   /* fallback poll period if INT stalls (FLIGHT, 50 Hz) */
+/* STANDBY runs at 1.5 Hz, a sample every ~667 ms. A 100 ms timeout there
+ * "times out" six times between two perfectly healthy interrupts, so the
+ * slow profile gets its own: three missed samples' worth. */
+#define BMP388_IRQ_TIMEOUT_SLOW_MS 2000
 
 /* ===================================================================
  *  Public data -- plain value types. Nothing to hide here; these are
@@ -30,11 +33,10 @@ typedef struct {
     uint32_t seq;           // increments once per successful sample
 } bmp388_data_t;
 
+/* No bus fields: which bus, which pins and what clock are decided by
+ * sensor_bus (menuconfig -> SET sensor bus). */
 typedef struct {
-    spi_host_device_t host;
-    gpio_num_t        cs_pin;
     gpio_num_t        int_pin;
-    uint32_t          spi_freq_hz;
 
     uint8_t           osr_pressure;   // BMP3_OVERSAMPLING_Xx
     uint8_t           osr_temp;       // BMP3_OVERSAMPLING_Xx
@@ -70,9 +72,8 @@ typedef struct bmp388_dev *bmp388_handle_t;
  *  Lifecycle
  * =================================================================== */
 
-/* Claims a slot from the static pool, adds the BMP388 as a device on
- * the given SPI bus (already initialized by the caller with
- * spi_bus_initialize), and brings it up via Bosch's official BMP3 API.
+/* Claims a slot from the static pool and brings the BMP388 up via Bosch's
+ * official BMP3 API, over sensor_bus (call sensor_bus_init() first).
  * Arms the INT pin, but does not start the reader task yet.
  * On success, *out is a handle for every other call to use. */
 esp_err_t bmp388_init(const bmp388_config_t *cfg, bmp388_handle_t *out);
@@ -113,8 +114,8 @@ void bmp388_get_diagnostics(bmp388_handle_t dev, bmp388_diag_t *out);
  * 1.5 Hz would give up most of the saving. Standby altitude is noisier
  * as a result -- the right trade for a vehicle sitting on a pad.
  *
- * MUST be called from the task that owns the SPI device. bmp388_task()
- * does this itself by watching flight_mode. */
+ * MUST be called from this sensor's own task -- Bosch's dev struct is not
+ * safe to share. bmp388_task() does this itself by watching flight_mode. */
 esp_err_t bmp388_set_rate(bmp388_handle_t dev, bool fast);
 
 bool bmp388_is_fast(bmp388_handle_t dev);

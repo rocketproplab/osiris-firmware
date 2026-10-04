@@ -2,6 +2,12 @@
 
 #include <string.h>
 
+#if defined(__has_include)
+#if __has_include("sdkconfig.h")
+#include "sdkconfig.h"      /* CONFIG_FC_MODE_TEST; absent in host tests */
+#endif
+#endif
+
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -146,6 +152,17 @@ bool flight_mode_note_landed(mode_source_t src)
                       "config until the ground confirms");
     }
     return changed;
+}
+
+bool flight_mode_test_force(flight_mode_t to)
+{
+#ifdef CONFIG_FC_MODE_TEST
+    return commit(to, MODE_SRC_TEST, "TEST sequence");
+#else
+    (void)to;
+    ESP_LOGE(TAG, "flight_mode_test_force() in a FLIGHT build -- refused");
+    return false;
+#endif
 }
 
 void flight_mode_get_diagnostics(flight_mode_diag_t *out)

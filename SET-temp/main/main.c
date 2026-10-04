@@ -1,13 +1,14 @@
 #include <stdio.h>
 #include <stdbool.h>
+#include <string.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/spi_master.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 
 
+#include "sensor_bus.h"
 #include "bmp388_sensor.h"
 #include "lsm6dsox_sensor.h"
 #include "gps_sensor.h"
@@ -15,6 +16,7 @@
 #include "telemetry.h"
 #include "flight_logic.h"
 #include "data_router.h"
+#include "config_receiver.h"
 #include "nvs_flash.h"
 #include "discrete_in.h"
 #include "event_log.h"
@@ -126,25 +128,34 @@ static const char *TAG = "main";
  *  internal I2C and USB -- leave those alone.
  * =================================================================== */
 
-/* One SPI bus shared by the barometer (J3) and the IMU (J4). Note that
- * the breakouts label their SPI pins with I2C names: SCL is the clock,
- * SDA is the controller's data OUT, and SDO/DO is the data back IN. */
-#define PIN_SCLK          GPIO_NUM_54  /* J1.1  -> J3.4 SCL, J4.4 SCL */
-#define PIN_MOSI          GPIO_NUM_19  /* J1.2  -> J3.6 SDA, J4.5 SDA */
-#define PIN_MISO          GPIO_NUM_18  /* J1.4  -> J3.5 SDO, J4.6 DO  */
-#define PIN_CS_BMP388     GPIO_NUM_14  /* J1.9  -> J3.7 CS  */
+/* One bus shared by the barometer (J3) and the IMU (J4). Whether those
+ * wires run as SPI or as I2C is a build-time choice made in menuconfig
+ * (SET sensor bus -> Interface) and owned entirely by the sensor_bus
+ * component -- it holds its own copy of these five pin numbers and sets
+ * them up itself. main.c does not open the bus and does not pass pins,
+ * hosts or clock rates to either driver.
+ *
+ * The five bus pins are listed here anyway, commented out, because this
+ * block is the board's pin map and a reader looking for GPIO54 should
+ * find it here. If the board is ever rewired, the numbers that matter
+ * are the ones at the top of components/sensor_bus/sensor_bus.c.
+ *
+ *   #define PIN_SCLK        GPIO_NUM_54   J1.1  -> J3.4 SCL, J4.4 SCL
+ *   #define PIN_MOSI        GPIO_NUM_19   J1.2  -> J3.6 SDA, J4.5 SDA
+ *   #define PIN_MISO        GPIO_NUM_18   J1.4  -> J3.5 SDO, J4.6 DO
+ *                                          (I2C build: address select, driven LOW)
+ *   #define PIN_CS_BMP388   GPIO_NUM_14   J1.9  -> J3.7 CS
+ *   #define PIN_CS_LSM6DSOX GPIO_NUM_17   J1.5  -> J4.7 CS
+ *
+ * The interrupt pins below are NOT bus pins -- each driver arms its own,
+ * so they stay here and stay passed in through config. */
 #define PIN_INT_BMP388    GPIO_NUM_6   /* J1.10 -> J3.8 INT */
-#define PIN_CS_LSM6DSOX   GPIO_NUM_17  /* J1.5  -> J4.7 CS  */
 #define PIN_INT_LSM6DSOX  GPIO_NUM_16  /* J1.6  -> J4.8 I1  */
 
 /* J4.9 (I2, the LSM6DSOX's second interrupt) is wired to GPIO15 on
- * J1.7. The driver only uses one interrupt line, so this is spare --
- * kept here so the next person can see the pin is taken, not free. */
-#define PIN_INT2_LSM6DSOX GPIO_NUM_15  /* J1.7  -> J4.9 I2, unused */
-
-#define SENSOR_SPI_HOST   SPI2_HOST     /* both SPI devices share this bus */
-#define BMP388_SPI_HZ     (8 * 1000 * 1000)    /* 8 MHz; chip is rated to 10 */
-#define LSM6DSOX_SPI_HZ   (10 * 1000 * 1000)   /* 10 MHz; chip is rated to 10 */
+ * J1.7. The driver routes its hardware wake-up (liftoff) block to this
+ * line -- see lsm6dsox_liftoff_detected(). */
+#define PIN_INT2_LSM6DSOX GPIO_NUM_15  /* J1.7  -> J4.9 I2, liftoff */
 
 /* GPS (J6, Adafruit PA1616D on JST-XH). TX/RX are named from the
  * ESP32's point of view: PIN_TX_GPS drives the module's RX input.
@@ -260,27 +271,42 @@ static StackType_t  s_print_stack[PRINT_TASK_STACK_WORDS];
 static StaticTask_t s_status_tcb;
 static StackType_t  s_status_stack[STATUS_TASK_STACK_WORDS];
 
+#ifdef CONFIG_FC_MODE_TEST
 /* ===================================================================
- *  SPI bus
+ *  TEST build: scripted mode sequence (menuconfig -> Flight Computer
+ *  Operating Mode). One step every CONFIG_FC_TEST_STEP_S seconds,
+ *  counted from when this task starts, i.e. once everything else is up:
+ *
+ *      STANDBY -> FLIGHT -> STANDBY -> FLIGHT -> STANDBY (and stays)
+ *
+ *  Uses flight_mode_test_force(), the only path out of FLIGHT, and it
+ *  exists only in this build. The task deletes itself when done.
  * =================================================================== */
+#define TEST_SEQ_STACK_WORDS  2048
+static StaticTask_t s_test_seq_tcb;
+static StackType_t  s_test_seq_stack[TEST_SEQ_STACK_WORDS];
 
-static esp_err_t sensor_bus_init(void)
+static void test_sequence_task(void *arg)
 {
-    spi_bus_config_t bus = {
-        .mosi_io_num     = PIN_MOSI,
-        .miso_io_num     = PIN_MISO,
-        .sclk_io_num     = PIN_SCLK,
-        .quadwp_io_num   = -1,
-        .quadhd_io_num   = -1,
-        .max_transfer_sz = 64,
+    (void)arg;
+    static const flight_mode_t steps[] = {
+        MODE_FLIGHT, MODE_STANDBY, MODE_FLIGHT, MODE_STANDBY,
     };
+    const int n = (int)(sizeof(steps) / sizeof(steps[0]));
+    const TickType_t step = pdMS_TO_TICKS(CONFIG_FC_TEST_STEP_S * 1000);
 
-    esp_err_t err = spi_bus_initialize(SENSOR_SPI_HOST, &bus, SPI_DMA_CH_AUTO);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "spi_bus_initialize failed: %s", esp_err_to_name(err));
+    /* DelayUntil, not Delay: the steps stay exactly step apart however
+     * long the logging inside the loop takes. */
+    TickType_t last = xTaskGetTickCount();
+    for (int i = 0; i < n; i++) {
+        vTaskDelayUntil(&last, step);
+        ESP_LOGW(TAG, "TEST step %d/%d -> %s", i + 1, n, flight_mode_name(steps[i]));
+        flight_mode_test_force(steps[i]);
     }
-    return err;
+    ESP_LOGW(TAG, "TEST sequence complete -- staying in STANDBY");
+    vTaskDelete(NULL);
 }
+#endif /* CONFIG_FC_MODE_TEST */
 
 /* ===================================================================
  *  BMP388 bring-up
@@ -288,11 +314,11 @@ static esp_err_t sensor_bus_init(void)
 
 static esp_err_t baro_start(bmp388_handle_t *out)
 {
+    /* No .host / .cs_pin / .spi_freq_hz: sensor_bus owns the bus, its
+     * pins and its clock. Only this sensor's own interrupt line is
+     * main.c's to hand over. */
     bmp388_config_t cfg = {
-        .host            = SENSOR_SPI_HOST,
-        .cs_pin          = PIN_CS_BMP388,
         .int_pin         = PIN_INT_BMP388,
-        .spi_freq_hz     = BMP388_SPI_HZ,
 
         /* 50 Hz with 8x pressure / 2x temperature oversampling -- Bosch's
          * suggested "drone" profile. Temperature changes slowly and only
@@ -300,7 +326,7 @@ static esp_err_t baro_start(bmp388_handle_t *out)
          * little. */
         .osr_pressure    = BMP3_OVERSAMPLING_8X,
         .osr_temp        = BMP3_OVERSAMPLING_2X,
-        .odr             = BMP3_ODR_50_HZ,
+        .odr             = BMP3_ODR_25_HZ,
 
         /* IIR smooths pressure noise that would otherwise show up as fake
          * vertical velocity. Coefficient 3 is a reasonable start; higher
@@ -336,12 +362,10 @@ static esp_err_t baro_start(bmp388_handle_t *out)
 
 static esp_err_t imu_start(lsm6dsox_handle_t *out)
 {
+    /* No .host / .cs_pin / .spi_freq_hz -- see the note in baro_start(). */
     lsm6dsox_config_t cfg = {
-        .host        = SENSOR_SPI_HOST,
-        .cs_pin      = PIN_CS_LSM6DSOX,
         .int_pin     = PIN_INT_LSM6DSOX,
         .int2_pin    = PIN_INT2_LSM6DSOX,
-        .spi_freq_hz = LSM6DSOX_SPI_HZ,
 
         /* Hardware liftoff detect on INT2. Deliberately a different
          * number from flight_logic.c's LIFTOFF_ACCEL_THRESHOLD_MS2
@@ -393,7 +417,7 @@ static esp_err_t gps_start_sensor(gps_handle_t *out)
         return err;
     }
 
-    /* Lower priority than the SPI sensor tasks -- GPS fixes arrive at
+    /* Lower priority than the bus sensor tasks -- GPS fixes arrive at
      * roughly 1 Hz, nowhere near as time-critical as the barometer or
      * IMU, so it doesn't need to preempt them. */
     err = gps_start(gps, PRIO_SENSORS, 0);
@@ -581,6 +605,29 @@ static void flight_logic_task(void *arg)
     uint32_t last = 0;
 
     for (;;) {
+        /* ---------------------------------------------------------------
+         *  Applying an uploaded config.
+         *
+         *  Done HERE, by the task that reads s_deploy_cfg, rather than
+         *  by whoever received the command. deploy_logic_update() is
+         *  handed a pointer to this struct on every tick; another task
+         *  overwriting it would be rewriting deployment thresholds and
+         *  per-channel arm state underneath a running estimator, and
+         *  there is no moment in that struct's layout where a partial
+         *  overwrite is harmless. At the top of this loop, between
+         *  ticks, there is no read in flight.
+         *
+         *  telemetry has already refused the command unless the vehicle
+         *  is in STANDBY or LANDED, so this cannot run during a flight.
+         * --------------------------------------------------------------- */
+        if (h->telemetry && telemetry_take_config_apply_request(h->telemetry)) {
+            esp_err_t cerr = deploy_logic_load_config(&s_deploy_cfg);
+            deploy_logic_init(&s_deploy_cfg);
+            event_log_event(EV_CONFIG_APPLIED, (uint8_t)flight_mode_get(),
+                            (uint32_t)cerr);
+            ESP_LOGW(TAG, "deployment config re-loaded from NVS and applied");
+        }
+
         lsm6_data_t imu;
         if (lsm6dsox_wait_for_sample(h->imu, last, &imu, pdMS_TO_TICKS(200)) != ESP_OK) {
             continue;
@@ -731,7 +778,20 @@ static void print_task(void *arg)
                    gps_is_new ? "(new)" : "(stale)",
                    (unsigned long)gps.seq);
         } else {
-            printf("             GPS: no fix yet\n");
+            /* The counters say WHY there is no fix, which "no fix yet"
+             * alone cannot:
+             *   all zero            -> no bytes at all: wiring/power
+             *   overflows climbing  -> bytes but no line ends: wrong baud
+             *   GGA climbing        -> sentences arrive, module has no fix
+             *   PPS climbing        -> the module itself HAS a fix */
+            gps_diag_t gd = {0};
+            gps_get_diagnostics(h->gps, &gd);
+            printf("             GPS: no fix yet  (GGA seen=%lu  errors=%lu  "
+                   "overflows=%lu  PPS=%lu)\n",
+                   (unsigned long)gd.sentences_parsed,
+                   (unsigned long)gd.parse_errors,
+                   (unsigned long)gd.line_overflows,
+                   (unsigned long)gd.pps_pulses);
         }
 
         if (h->battery) {
@@ -815,16 +875,132 @@ static esp_err_t battery_start_monitor(battery_handle_t *out)
 
 #define STATUS_PERIOD_MS   1000
 
+/* How long the card stays mounted with no eject command. 0 disables the
+ * timer entirely and restores the old behaviour (mounted until an
+ * uplink eject or power down). */
+#ifdef CONFIG_FC_SD_AUTO_EJECT_S
+#define SD_AUTO_EJECT_S    CONFIG_FC_SD_AUTO_EJECT_S
+#else
+#define SD_AUTO_EJECT_S    (6 * 60 * 60)
+#endif
+
+/* ===================================================================
+ *  Operator-commanded SD eject.
+ *
+ *  telemetry validated the command and the flight mode; this is the
+ *  part that actually touches the card. It runs in status_task because
+ *  that task already polls telemetry for pings, already holds every
+ *  handle, and is the only one that can afford to stop for the ~0.5 s
+ *  sd_logger_stop() spends waiting for the writer task to drain. Doing
+ *  it in the telemetry task instead would stall the radio pump for the
+ *  same half second, and doing it in a sensor task would stall a
+ *  sensor.
+ *
+ *  ORDER IS EVERYTHING HERE:
+ *
+ *    1. log the event, while the router still has an SD destination,
+ *       so it lands on the card as the last record in event.bin
+ *    2. detach the router, closing the window where another task can
+ *       hand records to a logger that is being torn down
+ *    3. clear our own handle, which is what STATUS_FLAG_SD_OK reports
+ *    4. stop the logger: drain, flush, close, unmount
+ *
+ *  Get 1 and 2 the wrong way round and the log never explains its own
+ *  ending.
+ * =================================================================== */
+static void status_eject_sd(sensor_handles_t *h, uint32_t cause)
+{
+    event_log_event(EV_SD_UNMOUNTED, (uint8_t)flight_mode_get(), cause);
+
+    sd_logger_handle_t sd = data_router_detach_sd();
+    h->sd = NULL;
+
+    if (!sd) {
+        return;
+    }
+
+    esp_err_t err = sd_logger_stop(sd);
+    if (err == ESP_OK) {
+        ESP_LOGW(TAG, "SD card unmounted on uplink command -- safe to remove. "
+                      "Power-cycle the flight computer to log again.");
+    } else {
+        /* The card is off the router either way, so logging has stopped
+         * regardless; what failed is the clean close. Say so on the
+         * downlink, since the operator is about to pull the card and
+         * this is the difference between a clean filesystem and a
+         * chkdsk. */
+        ESP_LOGE(TAG, "SD unmount FAILED: %s -- the card may not be clean",
+                 esp_err_to_name(err));
+        event_log_error(ERR_SRC_SD, ERR_CODE_WRITE_FAILED, err, 0);
+    }
+}
+
 static void status_task(void *arg)
 {
     sensor_handles_t *h = (sensor_handles_t *)arg;
     uint32_t seq = 0;
+    uint32_t last_sd_drops = 0;
+    bool auto_eject_deferred = false;
     const uint64_t boot_us = (uint64_t)esp_timer_get_time();
     TickType_t last_wake = xTaskGetTickCount();
 
     ESP_LOGI(TAG, "status task running on core %d", (int)xPortGetCoreID());
 
     for (;;) {
+        /* Performed before this tick's record is built, so the very
+         * next status the ground receives is already reporting
+         * STATUS_FLAG_SD_OK clear. telemetry sets the ping request
+         * alongside the eject request, so that record goes out now
+         * rather than at the next 1 Hz tick. */
+        if (h->telemetry && telemetry_take_sd_eject_request(h->telemetry)) {
+            /* Taken unconditionally, acted on only if there is a card.
+             * Guarding the take itself on h->sd would leave the request
+             * latched forever on a vehicle whose card never mounted --
+             * a flag that is set and never cleared is the kind of thing
+             * that fires at the worst possible moment later. */
+            if (h->sd) {
+                status_eject_sd(h, SD_UNMOUNT_CAUSE_UPLINK);
+            } else {
+                ESP_LOGW(TAG, "SD eject commanded, but no card is mounted");
+            }
+        }
+
+        /* ---------------------------------------------------------------
+         *  Auto-eject.
+         *
+         *  A vehicle left powered on the pad all day would otherwise sit
+         *  with a mounted card until somebody remembers to eject it or
+         *  pulls the battery, and pulling the battery is the case this
+         *  whole path exists to avoid. After SD_AUTO_EJECT_S of uptime
+         *  the card unmounts itself.
+         *
+         *  DEFERRED, never refused, while the vehicle is ARMED or in
+         *  FLIGHT: exactly the same gate the uplink command uses, so
+         *  there is one rule about when an eject is legal rather than
+         *  two. A long pad hold that turns into a launch at T+5:59
+         *  therefore cannot cost the flight -- the unmount simply waits
+         *  until the vehicle is back in STANDBY or LANDED.
+         * --------------------------------------------------------------- */
+        /* esp_timer_get_time() rather than rec.timestamp_us: this runs
+         * BEFORE this tick's record is built, so that the first status
+         * to go out after an auto-eject already reports SD_OK clear.
+         * rec does not exist yet at this point. */
+        const uint32_t uptime_s =
+            (uint32_t)(((uint64_t)esp_timer_get_time() - boot_us) / 1000000ULL);
+        if (h->sd && SD_AUTO_EJECT_S > 0 && uptime_s >= SD_AUTO_EJECT_S) {
+            flight_mode_t m = flight_mode_get();
+            if (m == MODE_STANDBY || m == MODE_LANDED) {
+                ESP_LOGW(TAG, "auto-eject: %d s of uptime reached, unmounting the card",
+                         (int)SD_AUTO_EJECT_S);
+                status_eject_sd(h, SD_UNMOUNT_CAUSE_TIMER);
+            } else if (!auto_eject_deferred) {
+                /* Once, not once a second. */
+                auto_eject_deferred = true;
+                ESP_LOGW(TAG, "auto-eject deadline reached in %s -- deferred until "
+                              "the vehicle is back in STANDBY or LANDED",
+                         flight_mode_name(m));
+            }
+        }
         bool pinged = h->telemetry && telemetry_take_ping_request(h->telemetry);
 
         status_record_t rec = {0};
@@ -847,10 +1023,6 @@ static void status_task(void *arg)
         }
         if (flight_mode_disarm_allowed()) { flags |= STATUS_FLAG_DISARM_OK; }
 
-        if (h->battery) {
-            battery_data_t b; battery_get_latest(h->battery, &b);
-            rec.battery_v = b.battery_v;
-        }
         /* AGL comes from flight_logic, which owns the pad reference.
          * This used to report bmp388's raw MSL altitude in a field named
          * altitude_agl_m -- off by the launch site's elevation, which at
@@ -875,10 +1047,16 @@ static void status_task(void *arg)
         if (flight_mode_get() == MODE_LANDED) { flags |= STATUS_FLAG_LANDED; }
         rec.flags = flags;
 
+        /* Latched rather than read straight through: after an eject
+         * there is no handle to ask, and a field that fell back to 0
+         * would read on the ground as "the drop counter cleared"
+         * instead of "this is where it stopped". The last real value
+         * keeps being reported. */
         if (h->sd) {
             sd_logger_diag_t sdd; sd_logger_get_diagnostics(h->sd, &sdd);
-            rec.sd_drops = sdd.queue_full_drops;
+            last_sd_drops = sdd.queue_full_drops;
         }
+        rec.sd_drops = last_sd_drops;
         if (h->telemetry) {
             telemetry_diag_t td; telemetry_get_diagnostics(h->telemetry, &td);
             rec.telem_drops = td.queue_full_drops;
@@ -921,6 +1099,28 @@ void app_main(void)
      * STANDBY: slow rates, gyro powered down, minimal airtime. */
     flight_mode_init();
 
+#ifdef CONFIG_FC_MODE_TEST
+    ESP_LOGE(TAG, "=====================================================");
+    ESP_LOGE(TAG, "  TEST BUILD -- NOT FOR FLIGHT");
+    ESP_LOGE(TAG, "  Scripted STANDBY/FLIGHT cycle, %d s per step.",
+             CONFIG_FC_TEST_STEP_S);
+    ESP_LOGE(TAG, "  menuconfig -> Flight Computer Operating Mode");
+    ESP_LOGE(TAG, "=====================================================");
+#endif
+
+#if !defined(CONFIG_FC_ENABLE_DISCRETE_IN)
+    /* Deliberately loud, and at error level. This is the board's only
+     * independent record of when the Blue Raven fired; a build that has
+     * stopped watching for it must not be able to look like a normal
+     * boot. See FC_ENABLE_DISCRETE_IN in menuconfig. */
+    ESP_LOGE(TAG, "=====================================================");
+    ESP_LOGE(TAG, " BLUE RAVEN DISCRETE INPUTS ARE DISABLED IN THIS BUILD");
+    ESP_LOGE(TAG, " Staging (J8) and recovery (J7) are NOT being watched.");
+    ESP_LOGE(TAG, " event.bin will contain no EV_STAGING_SIGNAL and no");
+    ESP_LOGE(TAG, " EV_RECOVERY_SIGNAL. Bench builds only -- turn this");
+    ESP_LOGE(TAG, " back on (FC_ENABLE_DISCRETE_IN) before flying.");
+    ESP_LOGE(TAG, "=====================================================");
+#else
     static const discrete_in_config_t discrete_cfgs[2] = {
         { .input_pin = PIN_STAGING_IN,  .output_pin = PIN_STAGING_OUT,
           .event = EV_STAGING_SIGNAL,  .channel = 0, .name = "staging",
@@ -941,30 +1141,62 @@ void app_main(void)
             return;
         }
     }
+#endif /* CONFIG_FC_ENABLE_DISCRETE_IN */
 
-    if (sensor_bus_init() != ESP_OK) {
+    /* The shared sensor bus, before either driver's init. Which interface
+     * this brings up -- SPI or I2C -- is decided at build time in
+     * menuconfig (SET sensor bus -> Interface); nothing here changes
+     * between the two. AFTER SWITCHING, REMOVE ALL POWER before testing:
+     * the BMP388 latches into SPI on its first CS edge and stays there
+     * until it loses power, and the reset button does not cut sensor
+     * power. */
+    esp_err_t bus_err = sensor_bus_init();
+    if (bus_err != ESP_OK) {
+        ESP_LOGE(TAG, "sensor bus (%s) init failed: %s",
+                 sensor_bus_name(), esp_err_to_name(bus_err));
+        event_log_error(ERR_SRC_SYSTEM, ERR_CODE_INIT_FAILED, bus_err, 0);
         return;
     }
 
-    if((baro_start(&s_sensors.baro) != ESP_OK) || (imu_start(&s_sensors.imu) != ESP_OK) || (gps_start_sensor(&s_sensors.gps) != ESP_OK)) {
+    /* Reads BMP388 CHIP_ID and LSM6DSOX WHO_AM_I and logs a verdict for
+     * each. Deliberately not a gate: a bad ID here is worth seeing in the
+     * log next to whichever driver then fails, rather than stopping boot
+     * before either of them gets to report. */
+    if (sensor_bus_check_ids() != ESP_OK) {
+        ESP_LOGW(TAG, "sensor bus (%s): chip-ID check failed -- see the lines "
+                      "above; sensor init below will almost certainly fail too",
+                 sensor_bus_name());
+    }
+
+    /* Each start function is called exactly once and its result kept.
+     * The previous form chained all three with || inside the if, which
+     * failed two ways: || short-circuits, so a sensor that failed early
+     * stopped the later ones from ever being started; and the diagnostic
+     * block below then called every start function a SECOND time, so a
+     * failing sensor was re-initialised and reported twice, and a sensor
+     * skipped by the short-circuit was reported on its first real
+     * attempt. Keeping the codes also means event.bin records what
+     * actually went wrong instead of a flat ESP_FAIL. */
+    esp_err_t baro_err = baro_start(&s_sensors.baro);
+    esp_err_t imu_err  = imu_start(&s_sensors.imu);
+    esp_err_t gps_err  = gps_start_sensor(&s_sensors.gps);
+
+    if (baro_err != ESP_OK || imu_err != ESP_OK || gps_err != ESP_OK) {
         ESP_LOGE(TAG, "One or more sensors failed to start");
-        //event_log_error(ERR_SRC_SENSORS, ERR_CODE_INIT_FAILED, ESP_FAIL, 0);
-        if (baro_start(&s_sensors.baro) != ESP_OK) {
-            ESP_LOGE(TAG, "barometer failed to start");
-            event_log_error(ERR_SRC_BMP388, ERR_CODE_INIT_FAILED, ESP_FAIL, 0);
-        }
 
-        if (gps_start_sensor(&s_sensors.gps) != ESP_OK) {
-            ESP_LOGE(TAG, "GPS failed to start");
-            event_log_error(ERR_SRC_GPS, ERR_CODE_INIT_FAILED, ESP_FAIL, 0);
+        if (baro_err != ESP_OK) {
+            ESP_LOGE(TAG, "barometer failed to start: %s", esp_err_to_name(baro_err));
+            event_log_error(ERR_SRC_BMP388, ERR_CODE_INIT_FAILED, baro_err, 0);
         }
-
-        if (imu_start(&s_sensors.imu) != ESP_OK) {
-            ESP_LOGE(TAG, "IMU failed to start");
-            event_log_error(ERR_SRC_LSM6DSOX, ERR_CODE_INIT_FAILED, ESP_FAIL, 0);
+        if (imu_err != ESP_OK) {
+            ESP_LOGE(TAG, "IMU failed to start: %s", esp_err_to_name(imu_err));
+            event_log_error(ERR_SRC_LSM6DSOX, ERR_CODE_INIT_FAILED, imu_err, 0);
+        }
+        if (gps_err != ESP_OK) {
+            ESP_LOGE(TAG, "GPS failed to start: %s", esp_err_to_name(gps_err));
+            event_log_error(ERR_SRC_GPS, ERR_CODE_INIT_FAILED, gps_err, 0);
         }
         return;
-
     }
     /*
     
@@ -987,6 +1219,14 @@ void app_main(void)
     }
 
     data_router_init(s_sensors.sd, s_sensors.telemetry);
+
+    /* Installed after the router, because the receiver's first act on a
+     * chunk is to log an event, and an event logged before the router
+     * exists goes nowhere. */
+    config_receiver_init();
+    if (s_sensors.telemetry) {
+        telemetry_set_uplink_hook(s_sensors.telemetry, config_receiver_handle_packet);
+    }
 
     /* Announced only now: before data_router_init() there was nowhere
      * for the record to go, so an earlier call would have been dropped
@@ -1061,4 +1301,14 @@ void app_main(void)
          * fatal the way a sensor or SD failure would be. */
         ESP_LOGE(TAG, "print_task creation failed -- continuing without console output");
     }
+
+#ifdef CONFIG_FC_MODE_TEST
+    /* Last, so the first step is timed from "everything is running". */
+    TaskHandle_t test_handle = xTaskCreateStaticPinnedToCore(
+        test_sequence_task, "test_seq", TEST_SEQ_STACK_WORDS, NULL,
+        PRIO_STATUS, s_test_seq_stack, &s_test_seq_tcb, 1);
+    if (!test_handle) {
+        ESP_LOGE(TAG, "test_sequence_task creation failed -- no TEST sequence");
+    }
+#endif
 }

@@ -40,6 +40,9 @@
  * @brief Sensor driver for BMP3 sensor */
 
 #include "bmp3.h"
+#include <rom/ets_sys.h>
+
+#include <stdio.h>
 
 /***************** Static function declarations ******************************/
 
@@ -763,6 +766,9 @@ int8_t bmp3_init(struct bmp3_dev *dev)
         rslt = bmp3_get_regs(BMP3_REG_CHIP_ID, &chip_id, 1, dev);
 
         /* Proceed if everything is fine until now */
+        printf("bmp3 init: rslt=%d\n", rslt);
+        printf("bmp3 init: chip_id_seen=%d\n", chip_id);
+        printf("bmp3 init: chip_id_expected=%d\n", BMP3_CHIP_ID);
         if (rslt == BMP3_OK)
         {
             /* Check for chip id validity */
@@ -812,9 +818,15 @@ int8_t bmp3_get_regs(uint8_t reg_addr, uint8_t *reg_data, uint32_t len, struct b
 
             /* Read the data from the register */
             dev->intf_rslt = dev->read(reg_addr, temp_buff, temp_len, dev->intf_ptr);
+            
+           // const reg_addr = reg_addr;
+           //ets_delay_us(500); 
+
             for (idx = 0; idx < len; idx++)
             {
+                //printf("read reg=0x%02X len=%lu rslt=%d\n", reg_addr, temp_len, dev->intf_rslt);
                 reg_data[idx] = temp_buff[idx + dev->dummy_byte];
+                // printf("temp_buff[%lu] = 0x%02X\n", (unsigned long)idx, temp_buff[idx]);
             }
         }
         else
