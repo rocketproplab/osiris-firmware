@@ -138,24 +138,4 @@ Useful flags:
 The ground side of the emulator is always API mode, same as the real ground
 radio.
 
-## 5. Tests
 
-```
-./test/host/run_host_tests.sh
-```
-
-Runs everything on a laptop, no hardware: both XBee modes, the uplink and
-downlink cross-checks between the C firmware and the Python tools, the ground
-station's reassembly and the emulator. It must end with `ALL HOST TESTS
-PASSED`.
-
-## Temporary radio diagnostics
-
-`components/telemetry/telemetry.c` still has some debug blocks from bring-up.
-They add a few seconds to every boot and print warnings:
-- `XBEE_RAW_DUMP_MS`
-- `XBEE_RX_ACTIVITY_MS`
-- `XBEE_DOUT_TEST_MS`
-- `XBEE_RX_TRACE`
-
-Set each to `0` once the radio is trusted.
