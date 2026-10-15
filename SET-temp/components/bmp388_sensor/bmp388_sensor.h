@@ -51,6 +51,12 @@ typedef struct {
     uint32_t read_errors;
     uint32_t irq_count;
     uint32_t irq_timeouts;
+    /* Contact with the chip -- see sensor_health.h. */
+    bool     lost;             // true right now: not publishing, retrying
+    uint32_t lost_count;       // times contact was lost
+    uint32_t recoveries;       // times it came back
+    uint32_t retry_attempts;   // re-init attempts across all outages
+    uint32_t last_outage_ms;   // length of the most recent outage
 } bmp388_diag_t;
 
 /* ===================================================================

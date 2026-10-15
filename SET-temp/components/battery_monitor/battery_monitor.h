@@ -64,6 +64,20 @@ typedef struct {
      * is flight_logic's business, not a monitor's. 0 disables. */
     float         warn_volts;
     float         critical_volts;
+
+    /* Two-point-style trim applied AFTER the divider:
+     *     battery_v = (adc_v / divider_ratio) * gain + offset_v
+     * Corrects what the resistor tolerances and the ADC calibration
+     * leave over, measured against a multimeter. adc_v is still logged
+     * untrimmed, so a later, better calibration can be applied offline
+     * to an old log. gain 0 => 1.0. */
+    float         gain;
+    float         offset_v;
+
+    /* Highest pack voltage this divider must read -- a 2S LiPo at full
+     * charge is 8.4 V. Used only for a boot-time check that the divider
+     * keeps the pin inside the ADC's range. 0 skips the check. */
+    float         max_pack_volts;
 } battery_config_t;
 
 typedef struct {
@@ -72,7 +86,15 @@ typedef struct {
     uint32_t warn_events;
     uint32_t critical_events;
     float    min_volts;      // lowest pack voltage seen since start
+    uint32_t clipped;        // samples at the ADC's full scale: the pack
+                             // voltage is HIGHER than reported, by an
+                             // unknown amount -- divider ratio too large
 } battery_diag_t;
+
+/* Usable top of the ADC at 12 dB attenuation, as a pin voltage. The same
+ * figure the uncalibrated fallback scales by. Above this the reading is
+ * pinned and the reported pack voltage is a floor, not a measurement. */
+#define BATTERY_ADC_FULL_SCALE_V  3.1f
 
 typedef struct battery_dev *battery_handle_t;
 

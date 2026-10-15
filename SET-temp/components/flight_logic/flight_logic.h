@@ -92,6 +92,15 @@ typedef struct {
     int   delay_ms;
     bool  manual_arm;
 
+    /* JSON "skip_imu_if_lost". When the IMU is unreliable -- silent for
+     * the failover time, or lost at any point after liftoff -- the
+     * IMU-only events (FANG1, FANG2, FUTANG, BURNCOUNT) are dropped from
+     * this channel's condition sets instead of reading FALSE. The rest
+     * of the set must still hold, and a set left with nothing in it is
+     * still never satisfied. Default false: without it, a lost IMU
+     * blocks any channel that asked for an attitude or burn check. */
+    bool  skip_imu_if_lost;
+
     // Runtime state (managed internally, don't set these from JSON)
     bool     armed;
     bool     timing;          // conditions became true, delay countdown running
@@ -105,6 +114,73 @@ typedef struct {
 } deploy_config_t;
 
 /* ===================================================================
+ *  Sensor failover.
+ *
+ *  Each sensor is judged by whether it is still producing NEW samples
+ *  (its sequence number moving), not by any driver flag, so the same
+ *  rule covers an unplugged chip, a dead task and a hung bus, and the
+ *  simulator exercises it without knowing about drivers at all.
+ *
+ *    IMU silent for CONFIG_FC_FAILOVER_MS
+ *        -> the logic keeps running on the barometer (or GPS) clock.
+ *           Tilt is invalid for the rest of the flight if this happens
+ *           after liftoff, and if liftoff has not been detected yet an
+ *           altitude-based detector stands in for the accelerometer.
+ *
+ *    Barometer silent for CONFIG_FC_FAILOVER_MS
+ *        -> altitude, velocity, apogee and every AGL/VEL/PINC event come
+ *           from GPS altitude instead, referenced to the pad.
+ *
+ *    Both     -> GPS for altitude, as above; the IMU rules still apply.
+ *
+ *    Nothing  -> altitude unknown: AGL, VEL, BVEL and PINC read FALSE.
+ *
+ *  A sensor that comes back is used again from its next sample.
+ * =================================================================== */
+typedef enum {
+    DEPLOY_ALT_BARO = 0,
+    DEPLOY_ALT_GPS  = 1,
+    DEPLOY_ALT_NONE = 2,
+} deploy_alt_source_t;
+
+/* Where vertical velocity, apogee and "descending" (PINC) come from.
+ * Separate from the altitude source because with the barometer lost the
+ * IMU, not the GPS, is the better instrument for these: velocity is
+ * integrated from the accelerometer at 104 Hz, where GPS gives a
+ * derivative of 1 Hz noisy fixes. Only the AGL events use GPS then.
+ *
+ *    barometer alive              -> BARO  (as before)
+ *    barometer silent, IMU alive  -> IMU   (altitude from GPS)
+ *    both silent                  -> GPS
+ *    nothing                      -> NONE  (VEL/BVEL/PINC read false)
+ *
+ * "IMU alive" means it has never been lost since liftoff: velocity is
+ * an integral, and an integral with a gap in it is wrong from then on.
+ * Numbered so that 0 and 1 mean the same sensor as deploy_alt_source_t,
+ * which is what EV_APOGEE's channel has always carried. */
+typedef enum {
+    DEPLOY_VEL_BARO = 0,
+    DEPLOY_VEL_GPS  = 1,
+    DEPLOY_VEL_NONE = 2,
+    DEPLOY_VEL_IMU  = 3,
+} deploy_vel_source_t;
+
+/* The slice of a GPS fix this component needs. Its own type rather
+ * than gps_data_t so flight_logic (and the simulator that compiles it)
+ * does not depend on the GPS driver. */
+typedef struct {
+    uint32_t seq;           /* advances once per valid fix; 0 = none yet */
+    float    altitude_m;    /* MSL */
+    uint8_t  fix_quality;   /* 0 = no fix */
+} deploy_gps_t;
+
+typedef struct {
+    const bmp388_data_t *baro;   /* latest barometer sample, may repeat */
+    const lsm6_data_t   *imu;    /* latest IMU sample, may repeat */
+    const deploy_gps_t  *gps;    /* NULL if there is no GPS input */
+} deploy_inputs_t;
+
+/* ===================================================================
  *  Flight state, derived once per tick and shared by every channel.
  *
  *  Exposed because main.c's status_task needs the same numbers for the
@@ -115,10 +191,10 @@ typedef struct {
     bool     ground_calibrated;
     float    ground_altitude_m;   // pad reference, MSL
     float    altitude_agl_m;
-    float    velocity_fps;        // signed; positive is climbing
+    float    velocity_fps;        // signed; positive is climbing -- from vel_source
     bool     liftoff;
     bool     apogee;
-    bool     pressure_increasing;
+    bool     pressure_increasing; // "descending", from vel_source
 
     bool     tilt_valid;          // gyro bias settled and integration running
     float    tilt_deg;            // angle between the vehicle axis and the
@@ -127,6 +203,14 @@ typedef struct {
     uint8_t  burn_count;          // motor burns started since liftoff
     bool     burning;             // a burn is in progress right now
     uint32_t liftoff_ms;
+
+    uint8_t  alt_source;          // deploy_alt_source_t
+    uint8_t  vel_source;          // deploy_vel_source_t
+    float    imu_velocity_mps;    // integrated from the accelerometer, m/s up
+    bool     imu_failover;        // IMU silent right now
+    bool     imu_degraded;        // IMU was lost after liftoff: tilt and
+                                  // burn count unreliable for this flight
+    bool     gps_ref_valid;       // GPS altitude can be turned into AGL
 } deploy_state_t;
 
 // Loads and parses the JSON config (matching the host app's format) out of
@@ -158,6 +242,15 @@ esp_err_t deploy_logic_init(deploy_config_t *cfg);
 // their conditions are recorded to event.bin; nothing is actuated.
 void deploy_logic_update(deploy_config_t *cfg, const bmp388_data_t *baro,
                           const lsm6_data_t *imu, uint32_t now_ms);
+
+// The same, with GPS and with no assumption that the IMU sample is new.
+// This is what the flight loop calls: it keeps calling when the IMU has
+// gone quiet (handing over the last sample again), which is what lets
+// the barometer and GPS carry the logic on their own. now_ms must come
+// from the same clock as the sensors' timestamps (esp_timer).
+// deploy_logic_update() is this with gps = NULL.
+void deploy_logic_update_ex(deploy_config_t *cfg, const deploy_inputs_t *in,
+                             uint32_t now_ms);
 
 // Snapshot of the derived flight state. Safe to call from another task:
 // the fields are written by one task and read by others, and a torn

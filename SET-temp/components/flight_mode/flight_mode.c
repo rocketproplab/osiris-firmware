@@ -18,6 +18,7 @@ static const char *TAG = "MODE";
 static flight_mode_t      s_mode = MODE_STANDBY;
 static flight_mode_diag_t s_diag;
 static portMUX_TYPE       s_lock = portMUX_INITIALIZER_UNLOCKED;
+static flight_mode_listener_t s_listener;   /* set once at boot; see header */
 
 const char *flight_mode_name(flight_mode_t m)
 {
@@ -87,7 +88,20 @@ static bool commit(flight_mode_t to, mode_source_t src, const char *why)
     /* channel carries the NEW mode, detail carries who asked. Recorded
      * outside the critical section: event_log ends in a ring push. */
     event_log_event(EV_MODE_CHANGED, (uint8_t)to, (uint32_t)src);
+
+    /* Read once into a local, same discipline as data_router_publish():
+     * the pointer is only ever written at boot, but a test-then-call on
+     * the global would be the pattern that breaks first if that changes. */
+    flight_mode_listener_t fn = s_listener;
+    if (fn) {
+        fn(from, to);
+    }
     return true;
+}
+
+void flight_mode_set_listener(flight_mode_listener_t fn)
+{
+    s_listener = fn;
 }
 
 bool flight_mode_arm(mode_source_t src)

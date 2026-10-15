@@ -105,6 +105,22 @@ bool flight_mode_test_force(flight_mode_t to);
 
 void flight_mode_get_diagnostics(flight_mode_diag_t *out);
 
+/* Called once per committed transition, AFTER the new mode is visible
+ * to flight_mode_get(), from whichever task caused the transition --
+ * lsm6dsox_task for an IMU liftoff, the telemetry task for an uplink
+ * ARM. Never from an ISR.
+ *
+ * It runs on that task's stack and in its time, so it must be short and
+ * must not block: the IMU liftoff path calls it in the same instant the
+ * vehicle starts flying. It exists for things that cannot wait for
+ * somebody's next poll of flight_mode_is_fast() -- the CPU clock lock
+ * in main.c is the reason it was added.
+ *
+ * One listener, set once during boot before any task that can change
+ * the mode is started. NULL clears it. */
+typedef void (*flight_mode_listener_t)(flight_mode_t from, flight_mode_t to);
+void flight_mode_set_listener(flight_mode_listener_t fn);
+
 /* "STANDBY" / "ARMED" / "FLIGHT" / "LANDED", for log lines. */
 const char *flight_mode_name(flight_mode_t m);
 

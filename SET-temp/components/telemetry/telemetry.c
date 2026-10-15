@@ -2,6 +2,13 @@
 #include "telemetry.h"
 
 #include <string.h>
+#include <stdlib.h>
+
+#if defined(__has_include)
+#if __has_include("sdkconfig.h")
+#include "sdkconfig.h"      /* CONFIG_TELEMETRY_XBEE_*; absent in host tests */
+#endif
+#endif
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -11,8 +18,33 @@
 #include "event_log.h"
 #include "xbee_api.h"
 #include "flight_mode.h"
+#include "uplink_stream.h"
 
 static const char *TAG = "TELEMETRY";
+
+/* menuconfig -> XBee telemetry link -> XBee serial mode. API is the
+ * normal mode; transparent is the backup for a module that cannot be
+ * (or has not been) put into AP=1. See components/telemetry/Kconfig. */
+#if defined(CONFIG_TELEMETRY_XBEE_TRANSPARENT)
+#define XBEE_TRANSPARENT 1
+#else
+#define XBEE_TRANSPARENT 0
+#endif
+
+#if XBEE_TRANSPARENT && defined(CONFIG_TELEMETRY_XBEE_TRANSPARENT_VERIFY)
+#define XBEE_TRANSPARENT_VERIFY 1
+#else
+#define XBEE_TRANSPARENT_VERIFY 0
+#endif
+
+/* Silence either side of +++. Must exceed the module's GT (1000 ms by
+ * default). Also used by an API build that suspects its module is
+ * really in transparent mode. */
+#if defined(CONFIG_TELEMETRY_XBEE_GUARD_MS)
+#define XBEE_GUARD_MS CONFIG_TELEMETRY_XBEE_GUARD_MS
+#else
+#define XBEE_GUARD_MS 1100
+#endif
 
 #define TELEMETRY_UART_BUF_SIZE   1024
 #define TELEMETRY_DEFAULT_BAUD    115200
@@ -51,6 +83,9 @@ struct telemetry_dev {
 
     xbee_parser_t        parser;
     uint64_t             last_rssi_poll_us;
+#if XBEE_TRANSPARENT
+    uplink_stream_t      ustream;     /* uplink packets out of raw DOUT bytes */
+#endif
 
     /* Uplink command state. last_cmd_seq starts at 0 and no command may
      * use seq 0, so the very first real command is always newer. */
@@ -91,6 +126,7 @@ static uint16_t crc16_ccitt(const uint8_t *data, size_t len)
 
 /* Frame IDs cycle 1..255. Zero is reserved by the XBee to mean "send me
  * no TX Status for this one", which would silently disable retry. */
+#if !XBEE_TRANSPARENT || XBEE_TRANSPARENT_VERIFY   /* API frames are built */
 static uint8_t next_frame_id(struct telemetry_dev *dev)
 {
     dev->next_frame_id++;
@@ -99,6 +135,7 @@ static uint8_t next_frame_id(struct telemetry_dev *dev)
     }
     return dev->next_frame_id;
 }
+#endif
 
 static uint16_t telemetry_build_packet(struct telemetry_dev *dev,
                                        uint8_t *out, uint8_t flags)
@@ -134,6 +171,21 @@ static bool telemetry_uart_send(struct telemetry_dev *dev,
                                 const uint8_t *packet, uint16_t packet_len,
                                 uint8_t frame_id)
 {
+#if XBEE_TRANSPARENT
+    /* The packet itself, nothing around it. The module sends whatever
+     * arrives on DIN to its stored DH/DL, cutting an RF packet when DIN
+     * goes quiet for RO character times or NP bytes have built up. One
+     * uart_write_bytes() keeps the packet's bytes back to back, so it
+     * normally leaves as one RF packet; the ground station copes when it
+     * does not.
+     *
+     * No accidental command mode: +++ is only honoured with GT of
+     * silence on BOTH sides, and every packet's bytes go out in one
+     * contiguous burst. */
+    (void)frame_id;
+    const uint8_t *frame = packet;
+    size_t n = packet_len;
+#else
     uint8_t frame[TELEMETRY_MAX_FRAME];
     uint64_t dest = dev->cfg.dest_addr ? dev->cfg.dest_addr : XBEE_ADDR_BROADCAST;
     size_t n = xbee_build_tx_request(frame_id, dest, packet, packet_len,
@@ -141,6 +193,7 @@ static bool telemetry_uart_send(struct telemetry_dev *dev,
     if (n == 0) {
         return false;
     }
+#endif
 
     int written = uart_write_bytes(dev->cfg.uart_port, (const char *)frame, n);
     if (written != (int)n) {
@@ -174,6 +227,22 @@ static void telemetry_flush_block(struct telemetry_dev *dev)
         return;
     }
 
+#if XBEE_TRANSPARENT
+    /* No TX Status ever comes back in transparent mode, so a parked copy
+     * would never be released: every slot would fill and each new packet
+     * would "abandon" the oldest. Send and forget; the radio's own MAC
+     * retries are all there is. */
+    portENTER_CRITICAL(&dev->diag_lock);
+    dev->diag.packets_built++;
+    dev->diag.records_sent += count;
+    portEXIT_CRITICAL(&dev->diag_lock);
+    if (telemetry_uart_send(dev, packet, packet_len, 0)) {
+        portENTER_CRITICAL(&dev->diag_lock);
+        dev->diag.packets_sent++;
+        portEXIT_CRITICAL(&dev->diag_lock);
+    }
+    dev->packet_seq++;
+#else
     uint8_t frame_id = next_frame_id(dev);
 
     /* Park a copy for retry BEFORE sending, so a TX Status arriving
@@ -219,8 +288,10 @@ static void telemetry_flush_block(struct telemetry_dev *dev)
     }
 
     dev->packet_seq++;
+#endif /* XBEE_TRANSPARENT */
 }
 
+#if !XBEE_TRANSPARENT
 static void telemetry_handle_tx_status(struct telemetry_dev *dev,
                                        const uint8_t *frame, uint16_t len)
 {
@@ -297,6 +368,7 @@ static void telemetry_handle_at_response(struct telemetry_dev *dev,
         portEXIT_CRITICAL(&dev->diag_lock);
     }
 }
+#endif /* !XBEE_TRANSPARENT */
 
 /* ===================================================================
  *  Uplink commands
@@ -469,6 +541,34 @@ static void telemetry_handle_command(struct telemetry_dev *dev,
              acted ? "ACCEPTED" : "refused");
 }
 
+#if XBEE_TRANSPARENT
+/* One complete, CRC-valid uplink packet found in the byte stream. From
+ * here on it is treated exactly like the payload of a 0x90 frame. */
+static void telemetry_on_stream_packet(void *ctx, const uint8_t *pl, uint16_t len)
+{
+    struct telemetry_dev *dev = (struct telemetry_dev *)ctx;
+#if XBEE_RX_TRACE
+    xbee_trace_hex("uplink packet (transparent)", pl, len);
+#endif
+    if (!dev->uplink_hook || !dev->uplink_hook(pl, len)) {
+        telemetry_handle_command(dev, pl, len);
+    }
+}
+
+static void telemetry_pump_rx(struct telemetry_dev *dev)
+{
+    uint8_t buf[128];
+    int n = uart_read_bytes(dev->cfg.uart_port, buf, sizeof(buf), 0);
+    const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    /* Called with n == 0 too: that is what lets a stale partial time out
+     * on a quiet link. */
+    uplink_stream_push(&dev->ustream, buf, n > 0 ? (size_t)n : 0, now_ms,
+                       telemetry_on_stream_packet, dev);
+    portENTER_CRITICAL(&dev->diag_lock);
+    dev->diag.uplink_discarded_bytes = dev->ustream.discarded_bytes;
+    portEXIT_CRITICAL(&dev->diag_lock);
+}
+#else
 static void telemetry_pump_rx(struct telemetry_dev *dev)
 {
     uint8_t buf[128];
@@ -515,6 +615,7 @@ static void telemetry_pump_rx(struct telemetry_dev *dev)
     dev->diag.bad_checksums = dev->parser.bad_checksums;
     portEXIT_CRITICAL(&dev->diag_lock);
 }
+#endif /* XBEE_TRANSPARENT */
 
 static bool telemetry_stage_record(struct telemetry_dev *dev, const queue_item_t *item)
 {
@@ -533,49 +634,62 @@ static bool telemetry_stage_record(struct telemetry_dev *dev, const queue_item_t
     return true;
 }
 
+/* One pass of the telemetry task: uplink in, records staged, block
+ * flushed on timeout, RSSI polled. Returns true if any record was
+ * staged. Split out of the task so the host test can drive it. */
+static bool telemetry_service(struct telemetry_dev *dev)
+{
+    queue_item_t item;
+    telemetry_pump_rx(dev);
+
+    bool got_one = false;
+    while (ring_buffer_pop(&dev->rb, &item)) {
+        got_one = true;
+        telemetry_stage_record(dev, &item);
+    }
+
+    uint64_t now = (uint64_t)esp_timer_get_time();
+
+    /* Size threshold is handled while staging; this is the timeout
+     * that stops a slow stream being held hostage. A 1 Hz GPS fix
+     * behind a size-only rule would wait for the IMU to fill the
+     * block, and on a quiet link it might wait forever. */
+    uint32_t block_ms = flight_mode_is_fast() ? TELEMETRY_BLOCK_MAX_MS
+                                              : TELEMETRY_STANDBY_BLOCK_MS;
+    if (dev->block_count > 0 &&
+        (now - dev->block_started_us) >= (uint64_t)block_ms * 1000ULL) {
+        telemetry_flush_block(dev);
+        dev->block_started_us = now;
+    }
+
+#if !XBEE_TRANSPARENT
+    /* Transparent mode has no way to ask: ATDB would need command mode,
+     * which means a second of silence either side of +++ with the
+     * downlink stopped. last_rssi stays 0, i.e. "unknown". */
+    if ((now - dev->last_rssi_poll_us) >= (uint64_t)TELEMETRY_RSSI_POLL_MS * 1000ULL) {
+        uint8_t f[16];
+        size_t n = xbee_build_at_query(next_frame_id(dev), 'D', 'B', f, sizeof(f));
+        if (n) {
+            uart_write_bytes(dev->cfg.uart_port, (const char *)f, n);
+        }
+        dev->last_rssi_poll_us = now;
+    }
+#endif
+    return got_one;
+}
+
 static void telemetry_task(void *arg)
 {
     struct telemetry_dev *dev = (struct telemetry_dev *)arg;
     queue_item_t item;
 
-    ESP_LOGI(TAG, "telemetry task running on core %d (XBee API mode)",
-             (int)xPortGetCoreID());
+    ESP_LOGI(TAG, "telemetry task running on core %d (XBee %s mode)",
+             (int)xPortGetCoreID(), XBEE_TRANSPARENT ? "TRANSPARENT" : "API");
 
     dev->block_started_us = (uint64_t)esp_timer_get_time();
 
     while (dev->task_should_run) {
-        telemetry_pump_rx(dev);
-
-        bool got_one = false;
-        while (ring_buffer_pop(&dev->rb, &item)) {
-            got_one = true;
-            telemetry_stage_record(dev, &item);
-        }
-
-        uint64_t now = (uint64_t)esp_timer_get_time();
-
-        /* Size threshold is handled while staging; this is the timeout
-         * that stops a slow stream being held hostage. A 1 Hz GPS fix
-         * behind a size-only rule would wait for the IMU to fill the
-         * block, and on a quiet link it might wait forever. */
-        uint32_t block_ms = flight_mode_is_fast() ? TELEMETRY_BLOCK_MAX_MS
-                                                  : TELEMETRY_STANDBY_BLOCK_MS;
-        if (dev->block_count > 0 &&
-            (now - dev->block_started_us) >= (uint64_t)block_ms * 1000ULL) {
-            telemetry_flush_block(dev);
-            dev->block_started_us = now;
-        }
-
-        if ((now - dev->last_rssi_poll_us) >= (uint64_t)TELEMETRY_RSSI_POLL_MS * 1000ULL) {
-            uint8_t f[16];
-            size_t n = xbee_build_at_query(next_frame_id(dev), 'D', 'B', f, sizeof(f));
-            if (n) {
-                uart_write_bytes(dev->cfg.uart_port, (const char *)f, n);
-            }
-            dev->last_rssi_poll_us = now;
-        }
-
-        if (!got_one) {
+        if (!telemetry_service(dev)) {
             vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
@@ -642,6 +756,7 @@ static void xbee_hard_reset(struct telemetry_dev *dev)
  * not the response we want (a stray 0x90 from a ground station already
  * transmitting, say) are parsed and discarded -- the parser must stay
  * fed or it would resynchronise mid-frame later. */
+#if !XBEE_TRANSPARENT || XBEE_TRANSPARENT_VERIFY
 static bool xbee_probe_once(struct telemetry_dev *dev, uint32_t *version_out)
 {
     uint8_t frame[XBEE_MAX_FRAME_DATA];
@@ -688,6 +803,7 @@ static bool xbee_probe(struct telemetry_dev *dev, uint32_t *version_out)
     }
     return false;
 }
+#endif
 
 /* ===================================================================
  *  TEMPORARY -- raw UART dump.
@@ -809,7 +925,7 @@ static void xbee_dump_raw(struct telemetry_dev *dev, const char *when)
 #define XBEE_RX_ACTIVITY_MS  300   /* watch window; 0 disables */
 #define XBEE_RX_ACTIVITY_MAX 64    /* bytes kept for the hex dump */
 
-#if XBEE_RX_ACTIVITY_MS > 0
+#if XBEE_RX_ACTIVITY_MS > 0 && !XBEE_TRANSPARENT
 static void xbee_rx_activity_test(struct telemetry_dev *dev)
 {
     const int pin = dev->cfg.rx_pin;
@@ -933,8 +1049,211 @@ static void xbee_rx_activity_test(struct telemetry_dev *dev)
 #endif /* XBEE_RX_ACTIVITY_MS */
 
 /* Reset, verify, and only escape if verification failed. */
+#if !XBEE_TRANSPARENT || XBEE_TRANSPARENT_VERIFY
+/* ===================================================================
+ *  Command mode (+++), the transparent-mode way to talk to the module.
+ *
+ *  Used at boot only: by a TRANSPARENT build to verify the radio, and by
+ *  an API build whose probe went unanswered, to find out whether the
+ *  module is simply in the other mode. Never while telemetry is running
+ *  -- entering command mode needs GT of silence on DIN either side of
+ *  the +++, which would mean stopping the downlink.
+ *
+ *  Replies are CR-terminated ASCII lines. Lines that are not the answer
+ *  we want (uplink bytes from a ground station that is already talking,
+ *  say) are skipped rather than trusted.
+ * =================================================================== */
+static bool xbee_cmd_read_line(struct telemetry_dev *dev, char *line, size_t cap,
+                               int timeout_ms)
+{
+    size_t n = 0;
+    const int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    while (esp_timer_get_time() < deadline) {
+        uint8_t c;
+        if (uart_read_bytes(dev->cfg.uart_port, &c, 1, pdMS_TO_TICKS(10)) != 1) {
+            continue;
+        }
+        if (c == '\r' || c == '\n') {
+            if (n == 0) { continue; }
+            line[n] = '\0';
+            return true;
+        }
+        if (n + 1 < cap) { line[n++] = (char)c; }
+    }
+    return false;
+}
+
+static bool xbee_cmd_is_hex(const char *t)
+{
+    size_t n = strlen(t);
+    if (n == 0 || n > 16) { return false; }
+    for (size_t i = 0; i < n; i++) {
+        char c = t[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Waits until a line equal to `want` (or, with want == NULL, a hex
+ * number) arrives. "ERROR" ends the wait early. */
+static bool xbee_cmd_expect(struct telemetry_dev *dev, const char *want,
+                            char *out, size_t cap, int timeout_ms)
+{
+    char line[40];
+    const int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    while (esp_timer_get_time() < deadline) {
+        int left = (int)((deadline - esp_timer_get_time()) / 1000);
+        if (left <= 0 || !xbee_cmd_read_line(dev, line, sizeof line, left)) {
+            return false;
+        }
+        if (strcmp(line, "ERROR") == 0) { return false; }
+        if (want ? strcmp(line, want) == 0 : xbee_cmd_is_hex(line)) {
+            if (out && cap) { strncpy(out, line, cap - 1); out[cap - 1] = '\0'; }
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool xbee_cmd_mode_enter(struct telemetry_dev *dev)
+{
+    vTaskDelay(pdMS_TO_TICKS(XBEE_GUARD_MS));           /* silence before */
+    uart_flush_input(dev->cfg.uart_port);
+    if (uart_write_bytes(dev->cfg.uart_port, "+++", 3) != 3) { return false; }
+    /* The module answers OK only after GT of silence AFTER the +++. */
+    return xbee_cmd_expect(dev, "OK", NULL, 0, XBEE_GUARD_MS + 1000);
+}
+
+static bool xbee_cmd_query(struct telemetry_dev *dev, const char *at,
+                           char *out, size_t cap)
+{
+    char cmd[8];
+    int n = snprintf(cmd, sizeof cmd, "%s\r", at);
+    if (n <= 0 || uart_write_bytes(dev->cfg.uart_port, cmd, (size_t)n) != n) {
+        return false;
+    }
+    return xbee_cmd_expect(dev, NULL, out, cap, 500);
+}
+
+static void xbee_cmd_mode_exit(struct telemetry_dev *dev)
+{
+    uart_write_bytes(dev->cfg.uart_port, "ATCN\r", 5);
+    if (!xbee_cmd_expect(dev, "OK", NULL, 0, 500)) {
+        /* Not fatal: the module drops out of command mode on its own
+         * after CT (10 s by default). Anything sent before then is
+         * taken as AT commands, not data -- hence the warning. */
+        ESP_LOGW(TAG, "ATCN not acknowledged -- module may stay in command "
+                      "mode for up to CT (10 s by default)");
+    }
+}
+
+/* +++, ATVR (and optionally ATDH/ATDL), ATCN. True if ATVR answered. */
+static bool xbee_transparent_probe(struct telemetry_dev *dev, uint32_t *version,
+                                   uint64_t *dest)
+{
+    if (!xbee_cmd_mode_enter(dev)) {
+        return false;
+    }
+    char v[20];
+    bool ok = xbee_cmd_query(dev, "ATVR", v, sizeof v);
+    if (ok && version) {
+        *version = (uint32_t)strtoul(v, NULL, 16);
+    }
+    char hi[20], lo[20];
+    if (ok && dest &&
+        xbee_cmd_query(dev, "ATDH", hi, sizeof hi) &&
+        xbee_cmd_query(dev, "ATDL", lo, sizeof lo)) {
+        *dest = ((uint64_t)strtoul(hi, NULL, 16) << 32) | (uint64_t)strtoul(lo, NULL, 16);
+    }
+    xbee_cmd_mode_exit(dev);
+    return ok;
+}
+#endif /* command mode helpers */
+
+#if XBEE_TRANSPARENT
+static void xbee_bringup_transparent(struct telemetry_dev *dev)
+{
+#if XBEE_RAW_DUMP_MS > 0
+    xbee_dump_raw(dev, "power-on, we are silent");
+#endif
+    uart_flush_input(dev->cfg.uart_port);
+    xbee_hard_reset(dev);
+#if XBEE_RAW_DUMP_MS > 0
+    xbee_dump_raw(dev, "after hard reset");
+#endif
+
+    if (dev->cfg.dest_addr) {
+        ESP_LOGW(TAG, "transparent mode: dest_addr %016llX is IGNORED -- the module's "
+                      "own DH/DL decide where packets go",
+                 (unsigned long long)dev->cfg.dest_addr);
+    }
+
+#if !XBEE_TRANSPARENT_VERIFY
+    dev->diag.radio_verified = false;
+    ESP_LOGW(TAG, "transparent mode, boot check disabled in menuconfig -- "
+                  "sending blind (radio reported as unverified)");
+#else
+    uint32_t version = 0;
+    uint64_t dest = 0;
+
+    bool ok = xbee_transparent_probe(dev, &version, &dest);
+    if (!ok) {
+        /* Same reasoning as the API path: a module stuck in its
+         * bootloader answers nothing until it is told to run. */
+        static const char escape[] = XBEE_ESCAPE_BYTES;
+        ESP_LOGW(TAG, "no answer to +++ -- sending bootloader escape");
+        uart_write_bytes(dev->cfg.uart_port, escape, sizeof(escape) - 1);
+        dev->diag.bootloader_escapes++;
+        vTaskDelay(pdMS_TO_TICKS(XBEE_ESCAPE_SETTLE_MS));
+        ok = xbee_transparent_probe(dev, &version, &dest);
+        if (ok) {
+            ESP_LOGW(TAG, "radio answered AFTER the bootloader escape -- check that "
+                          "DIN is not held low across the module's reset");
+        }
+    }
+    if (ok) {
+        dev->diag.radio_verified = true;
+        ESP_LOGI(TAG, "radio verified (transparent): ATVR = 0x%04X, sending to "
+                      "DH:DL = %016llX%s", (unsigned)version,
+                 (unsigned long long)dest,
+                 dest == 0xFFFFull ? " (broadcast)" : "");
+        return;
+    }
+
+    /* Still nothing. One more question is worth asking: is the module in
+     * API mode? +++ is ignored there, but an API frame is not. */
+    uart_flush_input(dev->cfg.uart_port);
+    xbee_parser_reset(&dev->parser);
+    if (xbee_probe(dev, &version)) {
+        dev->diag.radio_verified = false;
+        dev->diag.wrong_mode_detected = true;
+        ESP_LOGE(TAG, "WRONG XBEE MODE -- this firmware is built for TRANSPARENT, but the "
+                      "module answered an API frame (ATVR = 0x%04X): it is set to AP=1. "
+                      "Either select API mode in menuconfig (XBee telemetry link) or set "
+                      "AP=0 in XCTU. Nothing will get through until they agree.",
+                 (unsigned)version);
+        event_log_error(ERR_SRC_TELEMETRY, ERR_CODE_INIT_FAILED, ESP_ERR_INVALID_STATE, 1);
+        return;
+    }
+
+    dev->diag.radio_verified = false;
+    ESP_LOGE(TAG, "RADIO NOT VERIFIED -- no answer to +++ (transparent) or ATVR (API). "
+                  "Check: baud %d? powered? GT shorter than %d ms? "
+                  "Telemetry will still transmit blindly.",
+             dev->cfg.baud_rate, XBEE_GUARD_MS);
+    event_log_error(ERR_SRC_TELEMETRY, ERR_CODE_INIT_FAILED, ESP_ERR_TIMEOUT, 0);
+#endif /* XBEE_TRANSPARENT_VERIFY */
+}
+#endif /* XBEE_TRANSPARENT */
+
 static void xbee_bringup(struct telemetry_dev *dev)
 {
+#if XBEE_TRANSPARENT
+    xbee_bringup_transparent(dev);
+    return;
+#else
     uint32_t version = 0;
 
 #if XBEE_RAW_DUMP_MS > 0
@@ -957,7 +1276,7 @@ static void xbee_bringup(struct telemetry_dev *dev)
     xbee_dump_raw(dev, "after hard reset");
 #endif
 
-#if XBEE_RX_ACTIVITY_MS > 0
+#if XBEE_RX_ACTIVITY_MS > 0 && !XBEE_TRANSPARENT
     /* The module has booted; now ask it something and watch GPIO4. */
     xbee_rx_activity_test(dev);
 #endif
@@ -993,6 +1312,21 @@ static void xbee_bringup(struct telemetry_dev *dev)
         return;
     }
 
+    /* Before giving up: is the module just in TRANSPARENT mode? That is
+     * the commonest reason for silence here, and +++ answers it in about
+     * two and a half seconds -- spent only on this already-failed path. */
+    if (xbee_transparent_probe(dev, &version, NULL)) {
+        dev->diag.radio_verified = false;
+        dev->diag.wrong_mode_detected = true;
+        ESP_LOGE(TAG, "WRONG XBEE MODE -- this firmware is built for API (AP=1), but the "
+                      "module answered +++ (ATVR = 0x%04X): it is in TRANSPARENT mode "
+                      "(AP=0). Either set AP=1 in XCTU or select Transparent in "
+                      "menuconfig (XBee telemetry link). Nothing will get through "
+                      "until they agree.", (unsigned)version);
+        event_log_error(ERR_SRC_TELEMETRY, ERR_CODE_INIT_FAILED, ESP_ERR_INVALID_STATE, 1);
+        return;
+    }
+
     /* Deliberately not a failure. A vehicle that refuses to boot because
      * its downlink is deaf has traded a degraded flight for no flight,
      * and the SD card is the flight record that actually matters. Fly
@@ -1003,6 +1337,7 @@ static void xbee_bringup(struct telemetry_dev *dev)
                   "Telemetry will still queue and transmit blindly.",
              dev->cfg.baud_rate);
     event_log_error(ERR_SRC_TELEMETRY, ERR_CODE_INIT_FAILED, ESP_ERR_TIMEOUT, 0);
+#endif /* XBEE_TRANSPARENT */
 }
 
 /* ===================================================================
@@ -1210,6 +1545,10 @@ esp_err_t telemetry_init(const telemetry_config_t *cfg, telemetry_handle_t *out)
     if (dev->cfg.imu_decimation == 0) { dev->cfg.imu_decimation = TELEMETRY_IMU_DECIMATION; }
     dev->next_frame_id = 0;
     xbee_parser_reset(&dev->parser);
+#if XBEE_TRANSPARENT
+    uplink_stream_reset(&dev->ustream);
+#endif
+    dev->diag.transparent = XBEE_TRANSPARENT;
 
     uart_config_t uart_cfg = {
         .baud_rate  = dev->cfg.baud_rate,
@@ -1265,7 +1604,8 @@ esp_err_t telemetry_init(const telemetry_config_t *cfg, telemetry_handle_t *out)
 
     *out = dev;
 
-    /* The module must ALREADY be in API mode (AP=1) at this baud. That
+    /* The module must ALREADY be in the mode this build expects (AP=1,
+     * or AP=0 for a TRANSPARENT build) at this baud. That
      * is deliberately not done here: switching an XBee into API mode
      * means +++, a guard-time wait, ATAP1, ATWR -- and if any of it
      * half-succeeds you have a radio in an unknown state at an unknown
@@ -1274,11 +1614,12 @@ esp_err_t telemetry_init(const telemetry_config_t *cfg, telemetry_handle_t *out)
      * transparent mode this driver simply never sees a valid frame:
      * packets_acked stays 0 and last_rssi stays 0. */
     ESP_LOGI(TAG, "telemetry up: UART%d @ %d baud, tx=%d rx=%d, "
-                  "block %d B / %d ms, IMU 1-in-%u  (module must be AP=1)",
+                  "block %d B / %d ms, IMU 1-in-%u  (%s mode, module must be AP=%d)",
              dev->cfg.uart_port, dev->cfg.baud_rate,
              dev->cfg.tx_pin, dev->cfg.rx_pin,
              TELEMETRY_BLOCK_BYTES, TELEMETRY_BLOCK_MAX_MS,
-             (unsigned)dev->cfg.imu_decimation);
+             (unsigned)dev->cfg.imu_decimation,
+             XBEE_TRANSPARENT ? "TRANSPARENT" : "API", XBEE_TRANSPARENT ? 0 : 1);
     return ESP_OK;
 }
 

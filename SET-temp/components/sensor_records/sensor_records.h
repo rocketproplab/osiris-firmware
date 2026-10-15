@@ -220,6 +220,17 @@ typedef enum {
     EV_CONFIG_REJECTED,      // channel = CFG_REJECT_*, detail = reason-specific
     EV_CONFIG_APPLIED,       // the stored config is now the live one
                              //   channel = flight_mode_t at the time
+    /* A sensor stopped answering mid-run, and came back. See
+     * sensor_health.h. Appended, never inserted, like everything above. */
+    EV_SENSOR_LOST,          // channel = err_source_t, detail = sensor_lost_reason_t
+    EV_SENSOR_RECOVERED,     // channel = err_source_t, detail = outage in ms
+    /* flight_logic's sensor failover -- see flight_logic.h. */
+    EV_IMU_FAILOVER,         // channel 1 = IMU silent, logic on altitude only
+                             //   (detail = ms silent); 0 = IMU back (detail = outage ms)
+    EV_ALT_SOURCE,           // channel = deploy_alt_source_t now in use
+                             //   (0 baro, 1 GPS, 2 none), detail = flight-logic ms
+    EV_VEL_SOURCE,           // channel = deploy_vel_source_t now in use for
+                             //   velocity/apogee/PINC (0 baro, 1 GPS, 2 none, 3 IMU)
     EV_COUNT
 } event_type_t;
 

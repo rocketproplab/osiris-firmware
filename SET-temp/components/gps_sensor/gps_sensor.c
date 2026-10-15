@@ -11,6 +11,7 @@
 #include "esp_timer.h"
 #include "esp_attr.h"
 #include "data_router.h"
+#include "sensor_health.h"
 
 static const char *TAG = "GPS_PA1616D";
 
@@ -18,6 +19,13 @@ static const char *TAG = "GPS_PA1616D";
                                     // send a $PMTK251 command first to reconfigure it
 #define GPS_UART_BUF_SIZE   512
 #define GPS_LINE_MAX        128
+
+/* The module talks once a second whether or not it has a fix, so three
+ * seconds with not one NMEA sentence means it is not there: unplugged,
+ * its TX wire open, or unpowered. Measured from the later of the last
+ * sentence and the last time EN was raised, because the module needs
+ * about a second to boot before its first sentence. */
+#define GPS_SILENT_MS       3000
 
 /* ===================================================================
  *  The real struct -- private to this file, same idiom as bmp388_dev
@@ -30,6 +38,10 @@ struct gps_dev {
     gps_config_t        cfg;
     bool                initialized;
     bool                en_level;   // last level driven on EN
+    volatile uint32_t   en_raised_ms;  // esp_timer ms when EN last went high
+
+    /* Lost = no NMEA at all while powered. Touched only by gps_task. */
+    sensor_health_t     health;
 
     gps_data_t          latest;
     portMUX_TYPE        latest_lock;   /* replaces the old heap-allocated
@@ -155,21 +167,53 @@ static void parse_gga(gps_handle_t dev, char *sentence)
  *  just reading dev->cfg.uart_port instead of a fixed global.
  * =================================================================== */
 
+/* Is the module talking? Run on every pass of the reader loop, which
+ * wakes at least every 100 ms even with nothing on the wire. A module
+ * that is deliberately powered down (EN low, STANDBY) is not lost. */
+static void gps_check_health(gps_handle_t dev, uint32_t last_sentence_ms)
+{
+    uint64_t now_us = (uint64_t)esp_timer_get_time();
+    if (!dev->en_level) {
+        if (dev->health.lost) {
+            sensor_health_clear(&dev->health, now_us);
+        }
+        return;
+    }
+    uint32_t now_ms = (uint32_t)(now_us / 1000ULL);
+    uint32_t since  = now_ms - last_sentence_ms;
+    uint32_t booted = now_ms - dev->en_raised_ms;
+    if (since >= GPS_SILENT_MS && booted >= GPS_SILENT_MS) {
+        sensor_health_lost(&dev->health, SENSOR_LOST_NO_RESPONSE, now_us);
+    }
+    sensor_health_poll(&dev->health, now_us);
+}
+
 static void gps_task(void *arg)
 {
     gps_handle_t dev = (gps_handle_t)arg;
     char line[GPS_LINE_MAX];
     int line_pos = 0;
     uint8_t byte;
+    uint32_t last_sentence_ms = (uint32_t)((uint64_t)esp_timer_get_time() / 1000ULL);
 
     ESP_LOGI(TAG, "reader task running on core %d", (int)xPortGetCoreID());
 
     while (1) {
         int len = uart_read_bytes(dev->cfg.uart_port, &byte, 1, pdMS_TO_TICKS(100));
+        gps_check_health(dev, last_sentence_ms);
         if (len <= 0) continue;
 
         if (byte == '\n') {
             line[line_pos] = '\0';
+
+            /* Any NMEA sentence proves the module is alive, fix or not. */
+            if (line[0] == '$') {
+                last_sentence_ms = (uint32_t)((uint64_t)esp_timer_get_time() / 1000ULL);
+                if (dev->health.lost) {
+                    sensor_health_retry_result(&dev->health, true,
+                                               (uint64_t)esp_timer_get_time());
+                }
+            }
 
             if (strncmp(line, "$GPGGA", 6) == 0 || strncmp(line, "$GNGGA", 6) == 0) {
                 parse_gga(dev, line);
@@ -306,7 +350,12 @@ esp_err_t gps_init(const gps_config_t *cfg, gps_handle_t *out)
         gpio_set_level(dev->cfg.en_pin, 1);
         dev->en_level = true;
         ESP_LOGI(TAG, "GPS EN driven high on GPIO%d", (int)dev->cfg.en_pin);
+    } else {
+        dev->en_level = true;   /* floating EN: the module's pull-up keeps it on */
     }
+
+    dev->en_raised_ms = (uint32_t)((uint64_t)esp_timer_get_time() / 1000ULL);
+    sensor_health_init(&dev->health, ERR_SRC_GPS, (uint64_t)esp_timer_get_time());
 
     uart_config_t uart_cfg = {
         .baud_rate  = GPS_BAUD_RATE,
@@ -537,16 +586,52 @@ esp_err_t gps_set_enabled(gps_handle_t dev, bool enabled)
         return ESP_ERR_NOT_SUPPORTED;
     }
 
-    esp_err_t err = gpio_set_level(dev->cfg.en_pin, enabled ? 1 : 0);
-    if (err != ESP_OK) {
-        return err;
+    if (enabled == dev->en_level) {
+        return ESP_OK;              /* already there: no log spam on repeat calls */
     }
-    dev->en_level = enabled;
 
+    esp_err_t err;
     if (enabled) {
-        ESP_LOGI(TAG, "GPS enabled -- expect a cold start if it was off");
+        /* Power first, then hand TX back to the UART -- the reverse of
+         * the shutdown order below, so the ESP never drives the line of
+         * a module that is not powered. */
+        err = gpio_set_level(dev->cfg.en_pin, 1);
+        if (err != ESP_OK) {
+            return err;
+        }
+        err = uart_set_pin(dev->cfg.uart_port, dev->cfg.tx_pin, dev->cfg.rx_pin,
+                           UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+        if (err != ESP_OK) {
+            /* The module is powered and RX still works; only the ESP->GPS
+             * direction is lost, which nothing uses outside
+             * gps_reconfigure(). Report it, keep the GPS on. */
+            ESP_LOGE(TAG, "TX re-route failed: %s", esp_err_to_name(err));
+        }
+        dev->en_raised_ms = (uint32_t)((uint64_t)esp_timer_get_time() / 1000ULL);
+        dev->en_level = true;
+        ESP_LOGI(TAG, "GPS enabled (hot start with the coin cell fitted, cold without)");
     } else {
-        ESP_LOGW(TAG, "GPS disabled -- almanac and any custom baud are lost");
+        /* Release TX first: an output-disabled pad with no pulls, so the
+         * line simply floats rather than being held high into a module
+         * that is about to lose power. */
+        gpio_config_t tx_off = {
+            .pin_bit_mask = 1ULL << dev->cfg.tx_pin,
+            .mode         = GPIO_MODE_DISABLE,
+            .pull_up_en   = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type    = GPIO_INTR_DISABLE,
+        };
+        esp_err_t tx_err = gpio_config(&tx_off);
+        if (tx_err != ESP_OK) {
+            ESP_LOGW(TAG, "TX release failed: %s -- powering down anyway",
+                     esp_err_to_name(tx_err));
+        }
+        err = gpio_set_level(dev->cfg.en_pin, 0);
+        if (err != ESP_OK) {
+            return err;
+        }
+        dev->en_level = false;
+        ESP_LOGI(TAG, "GPS disabled (backup domain kept by the coin cell, if fitted)");
     }
     return ESP_OK;
 }

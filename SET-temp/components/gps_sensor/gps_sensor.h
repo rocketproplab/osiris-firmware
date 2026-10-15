@@ -123,11 +123,22 @@ esp_err_t gps_reconfigure(gps_handle_t dev, uint32_t new_baud, uint32_t update_r
 /* Drives the PA1616D's EN line. false puts the module into low-power
  * shutdown; true releases it.
  *
- * Be aware of what a power cycle costs: the module loses its acquired
- * almanac and any baud rate set by gps_reconfigure(), coming back at the
- * 9600 default and needing a cold start -- typically 30+ seconds to a
- * fix. That makes this a pad-side tool (save current before arming, or
- * force a known state), not something to reach for in flight.
+ * On the Adafruit breakout EN switches the module's 3.3 V regulator, and
+ * the CR1220 coin cell keeps the module's backup domain alive across
+ * that: RTC, ephemeris, almanac and any PMTK settings survive, so coming
+ * back on is a hot or warm start -- a fix in seconds, slower after a
+ * hold of several hours as the ephemeris ages. WITHOUT the coin cell
+ * every power-up is a cold start (30 s or more) and the module returns
+ * at its 9600 baud default. This firmware already runs at 9600, so the
+ * baud is not a problem either way; the fix delay is.
+ *
+ * While disabled the ESP stops driving the GPS RX line (GPIO27 floats),
+ * so an idle-high UART TX does not push current into an unpowered
+ * module through its input protection. Re-enabling restores the pin to
+ * the UART.
+ *
+ * EN carries a 10k pull-up on the breakout, so holding it low costs
+ * ~0.33 mA through that resistor -- small next to ~20 mA of tracking.
  *
  * Returns ESP_ERR_NOT_SUPPORTED if en_pin was GPIO_NUM_NC. */
 esp_err_t gps_set_enabled(gps_handle_t dev, bool enabled);

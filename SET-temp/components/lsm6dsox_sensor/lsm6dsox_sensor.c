@@ -10,6 +10,7 @@
 #include "event_log.h"
 #include "flight_mode.h"
 #include "sensor_bus.h"
+#include "sensor_health.h"
 
 static const char *TAG = "LSM6DSOX";
 
@@ -107,6 +108,10 @@ struct lsm6dsox_dev {
     bool                int2_isr_installed;
 
     lsm6dsox_diag_t     diag;
+
+    /* Lost / recovered bookkeeping. Touched only by lsm6dsox_task after
+     * init; read by lsm6dsox_get_diagnostics() for the console. */
+    sensor_health_t     health;
 };
 
 /* ===================================================================
@@ -164,18 +169,81 @@ static void IRAM_ATTR lsm6dsox_isr(void *arg)
 }
 
 /* ===================================================================
+ *  Is the chip still there?  (see sensor_health.h for the why)
+ * =================================================================== */
+
+static esp_err_t lsm6dsox_configure_sensor(lsm6dsox_handle_t dev, bool boot);
+
+/* WHO_AM_I (0x0F) and CTRL1_XL (0x10) are adjacent, and register
+ * auto-increment (CTRL3_C IF_INC) is on by default -- including straight
+ * after a reset -- so one two-byte read answers both questions: is the
+ * chip there, and is it still configured? A reset puts CTRL1_XL back to
+ * 0x00, accelerometer powered down, which no configuration of ours ever
+ * writes: standby is 12.5 Hz, not off. */
+static bool lsm6dsox_probe(lsm6dsox_handle_t dev, bool *configured)
+{
+    uint8_t r[2] = {0};
+    if (sensor_bus_read(SENSOR_BUS_LSM6DSOX, LSM6DSOX_WHO_AM_I_REG, r, 2) != ESP_OK) {
+        return false;
+    }
+    if (r[0] != LSM6DSOX_WHO_AM_I_VAL) {
+        return false;
+    }
+    if (configured) {
+        *configured = (r[1] & 0xF0) != 0;   /* ODR_XL non-zero */
+    }
+    return true;
+}
+
+/* Bring a chip that just reappeared back to the state the running
+ * firmware expects: software reset, the boot configuration WITHOUT its
+ * two 200 ms settling delays (a recovery in flight cannot afford 400 ms
+ * of nothing; the first few samples after an ODR change are merely
+ * less accurate), the INT2 wake-up block re-armed, then the rate for
+ * the CURRENT flight mode.
+ *
+ * The software liftoff latch (dev->liftoff_detected) lives in the ESP,
+ * not the chip, so a reset cannot clear it. Re-arming the wake-up block
+ * mid-flight may latch INT2 again on the next acceleration; the ISR
+ * only sets a flag that is already set, so that is harmless. */
+static bool lsm6dsox_recover(lsm6dsox_handle_t dev)
+{
+    if (!lsm6dsox_probe(dev, NULL)) {
+        return false;
+    }
+    if (lsm6dsox_configure_sensor(dev, false) != ESP_OK) {
+        return false;
+    }
+    if (!flight_mode_is_fast() && lsm6dsox_set_rate(dev, false) != ESP_OK) {
+        return false;
+    }
+    /* DRDY on INT1 stays high until the data is read, and the ISR is
+     * edge-triggered: a sample that became ready during the re-init
+     * would hold the line high and no edge would ever come. Reading the
+     * accelerometer once lets the line fall so the next sample rises. */
+    uint8_t discard[6];
+    (void)sensor_bus_read(SENSOR_BUS_LSM6DSOX, LSM6DSOX_OUTX_L_A, discard, 6);
+    return true;
+}
+
+/* ===================================================================
  *  Reader task
  * =================================================================== */
 
 static void lsm6dsox_task(void *arg)
 {
     lsm6dsox_handle_t dev = (lsm6dsox_handle_t)arg;
-    const TickType_t timeout = pdMS_TO_TICKS(LSM6DSOX_IRQ_TIMEOUT_MS);
 
     ESP_LOGI(TAG, "reader task running on core %d", (int)xPortGetCoreID());
 
     for (;;) {
+        TickType_t timeout = pdMS_TO_TICKS(LSM6DSOX_IRQ_TIMEOUT_MS);
+        if (dev->health.lost) {
+            timeout = pdMS_TO_TICKS(sensor_health_retry_wait_ms(
+                                        &dev->health, (uint64_t)esp_timer_get_time()));
+        }
         uint32_t notified = ulTaskNotifyTake(pdTRUE, timeout);
+        uint64_t now_us   = (uint64_t)esp_timer_get_time();
 
         /* Reconfiguration happens HERE, in this sensor's own task --
          * never from whatever task changed the mode. The telemetry task
@@ -189,8 +257,23 @@ static void lsm6dsox_task(void *arg)
          * flight_mode_note_liftoff() ends in a ring-buffer push, which
          * is not ISR-safe. It is idempotent and the latch is level-
          * triggered, so calling it every pass is the intended usage. */
+        /* Before anything that can bail out: the latch is set by the
+         * INT2 ISR, which needs no SPI, so a liftoff latched just before
+         * the chip dropped off the bus must still move the mode. */
         if (dev->liftoff_detected) {
             flight_mode_note_liftoff(MODE_SRC_IMU_WAKEUP);
+        }
+
+        /* ---- LOST: retry on schedule, publish nothing ----------------
+         * See bmp388_task: an absent chip reads back as zeros or 0xFF,
+         * and an IMU sample of all zeros looks exactly like free fall. */
+        if (dev->health.lost) {
+            if (sensor_health_retry_due(&dev->health, now_us)) {
+                bool ok = lsm6dsox_recover(dev);
+                sensor_health_retry_result(&dev->health, ok,
+                                           (uint64_t)esp_timer_get_time());
+            }
+            continue;
         }
 
         bool want_fast = flight_mode_is_fast();
@@ -198,11 +281,26 @@ static void lsm6dsox_task(void *arg)
             lsm6dsox_set_rate(dev, want_fast);
         }
 
+        /* ---- Health: on every missed interrupt, and once a second ----
+         * Same three-way split as the barometer. Chip fine but INT1
+         * quiet still falls through to the polling read, as before. */
+        if (notified == 0 || sensor_health_check_due(&dev->health, now_us)) {
+            bool configured = false;
+            if (!lsm6dsox_probe(dev, &configured)) {
+                sensor_health_lost(&dev->health, SENSOR_LOST_NO_RESPONSE, now_us);
+                continue;
+            }
+            if (!configured) {
+                sensor_health_lost(&dev->health, SENSOR_LOST_RESET, now_us);
+                continue;
+            }
+        }
+
         uint64_t stamp;
         if (notified == 0) {
             dev->diag.irq_timeouts++;
             event_log_error(ERR_SRC_LSM6DSOX, ERR_CODE_IRQ_TIMEOUT, ESP_ERR_TIMEOUT, dev->diag.irq_timeouts);
-            stamp = (uint64_t)esp_timer_get_time();
+            stamp = now_us;
         } else {
             stamp = dev->isr_timestamp_us;
         }
@@ -215,6 +313,26 @@ static void lsm6dsox_task(void *arg)
         if (err != ESP_OK) {
             dev->diag.read_errors++;
             event_log_error(ERR_SRC_LSM6DSOX, ERR_CODE_READ_FAILED, err, dev->diag.read_errors);
+            /* SPI never gets here; on I2C this is a NACK, which is what
+             * a missing chip looks like on that bus. */
+            if (!lsm6dsox_probe(dev, NULL)) {
+                sensor_health_lost(&dev->health, SENSOR_LOST_BUS_ERROR, now_us);
+            }
+            continue;
+        }
+
+        /* Every accelerometer byte identical at 0x00 or 0xFF is what an
+         * open data line reads back while DRDY keeps pulsing. A real
+         * sample hitting exactly that is vanishingly unlikely -- even in
+         * coast, drag and noise put a few counts on some axis -- but it
+         * only triggers a check, never a verdict on its own. */
+        bool all00 = true, allFF = true;
+        for (int i = 0; i < 6; i++) {
+            if (accel_raw[i] != 0x00) { all00 = false; }
+            if (accel_raw[i] != 0xFF) { allFF = false; }
+        }
+        if ((all00 || allFF) && !lsm6dsox_probe(dev, NULL)) {
+            sensor_health_lost(&dev->health, SENSOR_LOST_NO_RESPONSE, now_us);
             continue;
         }
 
@@ -351,7 +469,10 @@ static esp_err_t lsm6dsox_configure_wakeup(lsm6dsox_handle_t dev)
     return ESP_OK;
 }
 
-static esp_err_t lsm6dsox_configure_sensor(lsm6dsox_handle_t dev)
+/* boot = true is the original power-on path, with its settling delays
+ * and its log lines. boot = false is lsm6dsox_recover(): same register
+ * writes, no 200 ms waits, quiet. */
+static esp_err_t lsm6dsox_configure_sensor(lsm6dsox_handle_t dev, bool boot)
 {
     uint8_t who_am_i = 0;
     esp_err_t err = lsm6dsox_read_regs(dev, LSM6DSOX_WHO_AM_I_REG, &who_am_i, 1);
@@ -364,7 +485,9 @@ static esp_err_t lsm6dsox_configure_sensor(lsm6dsox_handle_t dev)
                  who_am_i, LSM6DSOX_WHO_AM_I_VAL);
         return ESP_ERR_NOT_FOUND;
     }
-    ESP_LOGI(TAG, "WHO_AM_I = 0x%02X (OK)", who_am_i);
+    if (boot) {
+        ESP_LOGI(TAG, "WHO_AM_I = 0x%02X (OK)", who_am_i);
+    }
 
     lsm6dsox_write_reg(dev, LSM6DSOX_CTRL3_C, 0x01);
 
@@ -385,7 +508,9 @@ static esp_err_t lsm6dsox_configure_sensor(lsm6dsox_handle_t dev)
         ESP_LOGE(TAG, "software reset timed out");
         return ESP_ERR_TIMEOUT;
     }
-    ESP_LOGI(TAG, "software reset complete");
+    if (boot) {
+        ESP_LOGI(TAG, "software reset complete");
+    }
 
     /* The reset put CTRL4_C back to defaults, which on an SPI build
      * re-enables the chip's I2C listener. sensor_bus turns it back off
@@ -405,17 +530,19 @@ static esp_err_t lsm6dsox_configure_sensor(lsm6dsox_handle_t dev)
 
     err = lsm6dsox_write_reg(dev, LSM6DSOX_CTRL1_XL, LSM6DSOX_CTRL1_XL_VAL);
     if (err != ESP_OK) { ESP_LOGE(TAG, "CTRL1_XL write failed"); return err; }
-    vTaskDelay(pdMS_TO_TICKS(200));
+    if (boot) { vTaskDelay(pdMS_TO_TICKS(200)); }
 
     err = lsm6dsox_write_reg(dev, LSM6DSOX_CTRL2_G, LSM6DSOX_CTRL2_G_VAL);
     if (err != ESP_OK) { ESP_LOGE(TAG, "CTRL2_G write failed"); return err; }
-    vTaskDelay(pdMS_TO_TICKS(200));
+    if (boot) { vTaskDelay(pdMS_TO_TICKS(200)); }
 
     err = lsm6dsox_write_reg(dev, LSM6DSOX_INT1_CTRL, 0x03);
     if (err != ESP_OK) { ESP_LOGE(TAG, "INT1_CTRL write failed"); return err; }
 
     dev->fast = true;
-    ESP_LOGI(TAG, "configured: accel 104Hz/+-16g, gyro 104Hz/+-2000dps, INT1=DRDY");
+    if (boot) {
+        ESP_LOGI(TAG, "configured: accel 104Hz/+-16g, gyro 104Hz/+-2000dps, INT1=DRDY");
+    }
 
     if (dev->cfg.int2_pin != GPIO_NUM_NC) {
         err = lsm6dsox_configure_wakeup(dev);
@@ -517,20 +644,28 @@ esp_err_t lsm6dsox_init(const lsm6dsox_config_t *cfg, lsm6dsox_handle_t *out)
 
     /* No bus setup here: sensor_bus_init() already did it, for whichever
      * bus this build uses. */
-    esp_err_t err = lsm6dsox_configure_sensor(dev);
+    /* Same rule as the barometer: a chip that does not answer at boot
+     * starts in the LOST state and is retried, rather than stopping boot
+     * before the radio can say so. */
+    bool present = (lsm6dsox_configure_sensor(dev, true) == ESP_OK);
+
+    esp_err_t err = lsm6dsox_setup_interrupt(dev);
     if (err != ESP_OK) {
         dev->in_use = false;
-        return err;
+        return err;     /* a GPIO problem: that one IS fatal */
     }
 
-    err = lsm6dsox_setup_interrupt(dev);
-    if (err != ESP_OK) {
-        dev->in_use = false;
-        return err;
-    }
+    uint64_t now_us = (uint64_t)esp_timer_get_time();
+    sensor_health_init(&dev->health, ERR_SRC_LSM6DSOX, now_us);
 
     dev->initialized = true;
     *out = dev;
+    if (!present) {
+        sensor_health_lost(&dev->health, SENSOR_LOST_NO_RESPONSE, now_us);
+        ESP_LOGE(TAG, "LSM6DSOX NOT ANSWERING -- driver started anyway, retrying "
+                      "every %d ms", SENSOR_HEALTH_RETRY_MS);
+        return ESP_ERR_NOT_FOUND;
+    }
     ESP_LOGI(TAG, "LSM6DSOX initialized (%s, interrupt-driven)", sensor_bus_name());
     return ESP_OK;
 }
@@ -674,6 +809,12 @@ void lsm6dsox_get_diagnostics(lsm6dsox_handle_t dev, lsm6dsox_diag_t *out)
      * the ISR itself, so the interrupt path stays a timestamp and two
      * stores. */
     out->liftoff_events = dev->liftoff_count;
+    /* Same unlocked-copy reasoning as bmp388_get_diagnostics(). */
+    out->lost           = dev->health.lost;
+    out->lost_count     = dev->health.lost_count;
+    out->recoveries     = dev->health.recoveries;
+    out->retry_attempts = dev->health.retry_attempts;
+    out->last_outage_ms = dev->health.last_outage_ms;
 }
 
 /* ===================================================================

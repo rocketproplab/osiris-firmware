@@ -9,6 +9,7 @@ run it directly:
     python tools/uplink_command.py --port COM5 arm
     python tools/uplink_command.py --port COM5 mark --arg 3
     python tools/uplink_command.py --selftest          # no hardware needed
+    python tools/uplink_command.py --port COM5 --transparent ping   # ground radio at AP=0
 
 WIRE FORMAT (10 bytes, little-endian)
 
@@ -430,6 +431,9 @@ def main() -> int:
     ap.add_argument("--seq", type=int, help="override the persisted sequence number")
     ap.add_argument("--dry-run", action="store_true", help="print the bytes, send nothing")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--transparent", action="store_true",
+                    help="ground radio is in transparent mode (AP=0): send the 10 bytes "
+                         "as they are, no API frame; the radio's DH/DL is the destination")
     ap.add_argument("--emit-vectors", action="store_true",
                     help="write cross-check vectors for the C host test")
     ap.add_argument("--emit-config-vectors", action="store_true",
@@ -449,11 +453,14 @@ def main() -> int:
 
     seq = args.seq if args.seq is not None else SeqCounter().next()
     payload = build_command(COMMANDS[args.command], seq, args.arg)
-    frame = xbee_tx_request(payload, args.dest)
+    frame = payload if args.transparent else xbee_tx_request(payload, args.dest)
 
     print(f"{args.command.upper()} seq={seq} arg=0x{args.arg:08X}")
     print(f"  payload : {' '.join(f'{b:02X}' for b in payload)}")
-    print(f"  frame   : {' '.join(f'{b:02X}' for b in frame)}")
+    if args.transparent:
+        print("  frame   : none (transparent: the payload is what goes on the wire)")
+    else:
+        print(f"  frame   : {' '.join(f'{b:02X}' for b in frame)}")
 
     if args.dry_run:
         return 0

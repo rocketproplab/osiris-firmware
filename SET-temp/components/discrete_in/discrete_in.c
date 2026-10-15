@@ -8,6 +8,47 @@
 #include "esp_attr.h"
 #include "event_log.h"
 
+#if defined(__has_include)
+#if __has_include("sdkconfig.h")
+#include "sdkconfig.h"
+#endif
+#endif
+
+#ifdef CONFIG_DISCRETE_IN_MODE_ANALOG
+#include "discrete_threshold.h"
+#include "adc1_shared.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+
+/* Usable top of the ADC at 12 dB attenuation, as a PIN voltage. */
+#define DISCRETE_ADC_FULL_SCALE_MV  3100
+#define DISCRETE_ADC_OVERSAMPLE     4
+#define DISCRETE_IDLE_EMA_SHIFT     6      /* idle average: ~64 samples */
+
+/* The divider: line_mv = pin_mv * (top + bottom) / bottom. A bottom of 0
+ * means no resistor to ground: the pin draws no current, so it reads the
+ * line 1:1 whatever the series resistor is. */
+#define DISCRETE_DIV_TOP     ((uint32_t)CONFIG_DISCRETE_IN_DIVIDER_TOP_OHMS)
+#define DISCRETE_DIV_BOTTOM  ((uint32_t)CONFIG_DISCRETE_IN_DIVIDER_BOTTOM_OHMS)
+
+static uint32_t pin_to_line_mv(uint32_t pin_mv)
+{
+    if (DISCRETE_DIV_BOTTOM == 0){ 
+        return pin_mv; 
+    } else {
+        return (uint32_t)(((uint64_t)pin_mv * (DISCRETE_DIV_TOP + DISCRETE_DIV_BOTTOM))
+                        / DISCRETE_DIV_BOTTOM);
+    }
+}
+
+static uint32_t line_to_pin_mv(uint32_t line_mv)
+{
+    if (DISCRETE_DIV_BOTTOM == 0) { return line_mv; }
+    return (uint32_t)(((uint64_t)line_mv * DISCRETE_DIV_BOTTOM)
+                      / (DISCRETE_DIV_TOP + DISCRETE_DIV_BOTTOM));
+}
+#endif
+
 static const char *TAG = "DISCRETE_IN";
 
 struct discrete_in_dev {
@@ -30,6 +71,13 @@ struct discrete_in_dev {
     volatile uint64_t   last_accepted_us;
     volatile bool       fired;
     discrete_in_diag_t    diag;
+
+#ifdef CONFIG_DISCRETE_IN_MODE_ANALOG
+    adc_channel_t       adc_ch;
+    adc_cali_handle_t   cali;
+    bool                cali_ok;
+    dthr_t              thr;
+#endif
 };
 
 static struct discrete_in_dev s_pool[DISCRETE_IN_MAX_INSTANCES];
@@ -45,7 +93,8 @@ static portMUX_TYPE         s_pool_lock = portMUX_INITIALIZER_UNLOCKED;
  *  scheduling would be measuring FreeRTOS, not the vehicle.
  * =================================================================== */
 
-static void IRAM_ATTR discrete_in_isr(void *arg)
+/* unused in ANALOG builds, which have no interrupt */
+__attribute__((unused)) static void IRAM_ATTR discrete_in_isr(void *arg)
 {
     struct discrete_in_dev *dev = (struct discrete_in_dev *)arg;
     BaseType_t hp_task_woken = pdFALSE;
@@ -84,7 +133,7 @@ static void IRAM_ATTR discrete_in_isr(void *arg)
  *  fired", so this waits indefinitely rather than guessing.
  * =================================================================== */
 
-static void discrete_in_task(void *arg)
+__attribute__((unused)) static void discrete_in_task(void *arg)
 {
     struct discrete_in_dev *dev = (struct discrete_in_dev *)arg;
 
@@ -125,6 +174,205 @@ static void discrete_in_task(void *arg)
         }
     }
 }
+
+#ifdef CONFIG_DISCRETE_IN_MODE_ANALOG
+/* ===================================================================
+ *  ANALOG MODE
+ *
+ *  The task samples the line every DISCRETE_IN_SAMPLE_MS and runs it
+ *  through discrete_threshold's two-threshold, N-sample state machine.
+ *  No interrupt: the ADC has none worth using here, and a periodic read
+ *  is what makes a level that sits ABOVE the digital HIGH threshold
+ *  when idle readable at all.
+ *
+ *  The minimum-interval filter still applies, to ACCEPTED firings, with
+ *  the same meaning as in digital mode.
+ * =================================================================== */
+
+/* One averaged reading, as mV on the Blue Raven side of the divider. */
+static bool discrete_read_line_mv(struct discrete_in_dev *dev, uint32_t *line_mv,
+                                  bool *clipped)
+{
+    int32_t sum = 0;
+    int good = 0;
+    for (int i = 0; i < DISCRETE_ADC_OVERSAMPLE; i++) {
+        int raw = 0;
+        if (adc1_shared_read(dev->adc_ch, &raw) == ESP_OK) {
+            sum += raw;
+            good++;
+        }
+    }
+    if (good == 0) {
+        return false;
+    }
+    int raw = (int)(sum / good);
+    *clipped = raw >= 4095 - 4;
+
+    int pin_mv = 0;
+    if (dev->cali_ok) {
+        if (adc_cali_raw_to_voltage(dev->cali, raw, &pin_mv) != ESP_OK) {
+            return false;
+        }
+    } else {
+        pin_mv = (raw * DISCRETE_ADC_FULL_SCALE_MV) / 4095;
+    }
+    *line_mv = pin_to_line_mv((uint32_t)pin_mv);
+
+//     ESP_LOGI(TAG, " %d volts", *line_mv);
+
+    return true;
+}
+
+static void discrete_in_accept(struct discrete_in_dev *dev, uint64_t edge_us, uint32_t mv)
+{
+    const char *name = dev->cfg.name ? dev->cfg.name : "discrete";
+
+    if (DISCRETE_IN_MIN_INTERVAL_US > 0 && dev->fired &&
+        (edge_us - dev->last_accepted_us) < DISCRETE_IN_MIN_INTERVAL_US) {
+        dev->diag.suppressed++;
+        return;
+    }
+    dev->last_accepted_us = edge_us;
+    if (!dev->fired) {
+        dev->diag.first_trigger_us = edge_us;
+        dev->fired = true;
+    }
+    uint32_t count = ++dev->diag.triggers;
+
+    ESP_LOGW(TAG, "%s SIGNAL at %llu us (trigger #%lu, line %lu mV >= %lu mV)",
+             name, (unsigned long long)edge_us, (unsigned long)count,
+             (unsigned long)mv, (unsigned long)dev->thr.fire_mv);
+    event_log_event_at(dev->cfg.event, dev->cfg.channel, count, edge_us);
+
+    if (dev->cfg.output_pin != GPIO_NUM_NC) {
+        gpio_set_level(dev->cfg.output_pin, DISCRETE_IN_OUTPUT_ACTIVE_LEVEL);
+    }
+}
+
+static void discrete_in_analog_task(void *arg)
+{
+    struct discrete_in_dev *dev = (struct discrete_in_dev *)arg;
+    const char *name = dev->cfg.name ? dev->cfg.name : "discrete";
+    TickType_t period = pdMS_TO_TICKS(CONFIG_DISCRETE_IN_SAMPLE_MS);
+    if (period == 0) { period = 1; }
+    TickType_t last_wake = xTaskGetTickCount();
+    bool announced = false, clip_said = false;
+
+    ESP_LOGI(TAG, "%s task running on core %d, sampling ADC1_CH%d every %d ms",
+             name, (int)xPortGetCoreID(), (int)dev->adc_ch, CONFIG_DISCRETE_IN_SAMPLE_MS);
+
+    for (;;) {
+        uint32_t mv = 0;
+        bool clipped = false;
+        uint64_t now_us = (uint64_t)esp_timer_get_time();
+        if (discrete_read_line_mv(dev, &mv, &clipped)) {
+            dev->diag.last_mv = mv;
+            if (mv > dev->diag.peak_mv) { dev->diag.peak_mv = mv; }
+            if (!dev->thr.high) {
+                /* Running average of the idle level: the number to set
+                 * the thresholds from, and how far the Blue Raven's
+                 * battery has sagged since boot. */
+                if (dev->diag.idle_mv == 0) { dev->diag.idle_mv = mv; }
+                else {
+                    dev->diag.idle_mv += ((int32_t)mv - (int32_t)dev->diag.idle_mv)
+                                         >> DISCRETE_IDLE_EMA_SHIFT;
+                }
+            }
+            if (clipped) {
+                dev->diag.clipped++;
+                /* Clipping while FIRED is expected with no divider: 3.7 V
+                 * reads as full scale, which is still above the threshold.
+                 * Clipping while IDLE is the real problem -- idle and fired
+                 * then read the same -- and it only needs saying once. */
+                if (!dev->thr.high && !clip_said) {
+                    clip_said = true;
+                    ESP_LOGE(TAG, "%s: ADC at FULL SCALE while IDLE -- the idle level "
+                                  "is above what can be measured, so a firing cannot "
+                                  "be told apart. Lower the idle level at the pin.", name);
+                    event_log_error(ERR_SRC_DISCRETE_IN, ERR_CODE_OVERFLOW, ESP_OK, mv);
+                }
+            }
+            if (!announced) {
+                announced = true;
+                ESP_LOGI(TAG, "%s line reads %lu mV at start (fire >= %lu, release <= %lu)",
+                         name, (unsigned long)mv, (unsigned long)dev->thr.fire_mv,
+                         (unsigned long)dev->thr.release_mv);
+                if (mv >= dev->thr.fire_mv) {
+                    ESP_LOGE(TAG, "%s is ALREADY at or above its fire threshold at "
+                                  "start -- it will report a firing now. Check the "
+                                  "threshold against the idle level.", name);
+                }
+            }
+
+            uint64_t edge_us = 0;
+            dthr_result_t r = dthr_step(&dev->thr, mv, now_us, &edge_us);
+            if (r == DTHR_ROSE) {
+                discrete_in_accept(dev, edge_us, mv);
+            } else if (r == DTHR_FELL) {
+                ESP_LOGI(TAG, "%s back to idle (%lu mV <= %lu mV)", name,
+                         (unsigned long)mv, (unsigned long)dev->thr.release_mv);
+            }
+        }
+        vTaskDelayUntil(&last_wake, period);
+    }
+}
+
+static esp_err_t discrete_in_analog_init(struct discrete_in_dev *dev)
+{
+    const char *name = dev->cfg.name ? dev->cfg.name : "discrete";
+    adc_unit_t unit;
+    esp_err_t err = adc_oneshot_io_to_channel((int)dev->cfg.input_pin, &unit, &dev->adc_ch);
+    if (err != ESP_OK || unit != ADC_UNIT_1) {
+        ESP_LOGE(TAG, "%s: GPIO%d is not an ADC1 pin -- analog mode impossible here",
+                 name, (int)dev->cfg.input_pin);
+        return err != ESP_OK ? err : ESP_ERR_NOT_SUPPORTED;
+    }
+    adc_oneshot_chan_cfg_t chan = {
+        .atten    = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    err = adc1_shared_config_channel(dev->adc_ch, &chan);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "%s: ADC channel config failed: %s", name, esp_err_to_name(err));
+        return err;
+    }
+#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+    adc_cali_curve_fitting_config_t cc = {
+        .unit_id  = ADC_UNIT_1,
+        .chan     = dev->adc_ch,
+        .atten    = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    dev->cali_ok = (adc_cali_create_scheme_curve_fitting(&cc, &dev->cali) == ESP_OK);
+#endif
+
+    dthr_init(&dev->thr, dev->cfg.fire_mv, dev->cfg.release_mv,
+              (uint16_t)CONFIG_DISCRETE_IN_CONFIRM_SAMPLES);
+
+    /* The check that matters most: can the ADC even see the threshold?
+     * With the divider bypassed (or too weak), the fire level sits above
+     * full scale and idle and fired both read as the top of the range. */
+    uint32_t fire_pin_mv = line_to_pin_mv(dev->thr.fire_mv);
+    if (fire_pin_mv >= DISCRETE_ADC_FULL_SCALE_MV) {
+        ESP_LOGE(TAG, "%s: fire threshold %lu mV puts %lu mV on the pin -- ABOVE the "
+                      "ADC's ~%d mV range. It can never be seen. Fit the divider, or "
+                      "set its values in menuconfig.", name,
+                 (unsigned long)dev->thr.fire_mv, (unsigned long)fire_pin_mv,
+                 DISCRETE_ADC_FULL_SCALE_MV);
+        event_log_error(ERR_SRC_DISCRETE_IN, ERR_CODE_CONFIG_INVALID, ESP_OK, fire_pin_mv);
+    }
+
+    ESP_LOGI(TAG, "%s armed (ANALOG): GPIO%d = ADC1_CH%d, series %lu / to-ground %lu ohm, "
+                  "fire >= %lu mV, release <= %lu mV, %d samples to confirm, %s, source=%s",
+             name, (int)dev->cfg.input_pin, (int)dev->adc_ch,
+             (unsigned long)DISCRETE_DIV_TOP, (unsigned long)DISCRETE_DIV_BOTTOM,
+             (unsigned long)dev->thr.fire_mv, (unsigned long)dev->thr.release_mv,
+             CONFIG_DISCRETE_IN_CONFIRM_SAMPLES,
+             dev->cali_ok ? "calibrated" : "UNCALIBRATED (+/-5%)",
+             dev->cfg.source ? dev->cfg.source : "UNSPECIFIED");
+    return ESP_OK;
+}
+#endif /* CONFIG_DISCRETE_IN_MODE_ANALOG */
 
 /* ===================================================================
  *  Public API
@@ -175,6 +423,21 @@ esp_err_t discrete_in_init(const discrete_in_config_t *cfg, discrete_in_handle_t
         }
         gpio_set_level(dev->cfg.output_pin, DISCRETE_IN_OUTPUT_IDLE_LEVEL);
     }
+
+#ifdef CONFIG_DISCRETE_IN_MODE_ANALOG
+    {
+        esp_err_t aerr = discrete_in_analog_init(dev);
+        if (aerr != ESP_OK) {
+            event_log_error(ERR_SRC_DISCRETE_IN, ERR_CODE_INIT_FAILED, aerr,
+                            (uint32_t)dev->cfg.input_pin);
+            dev->in_use = false;
+            return aerr;
+        }
+        dev->initialized = true;
+        *out = dev;
+        return ESP_OK;
+    }
+#endif
 
     /* Input -- idle LOW, rising edge. No internal pulldown: the board's
      * 3.6k divider leg already holds the line low while the Blue Raven
@@ -233,6 +496,18 @@ esp_err_t discrete_in_start(discrete_in_handle_t dev, UBaseType_t priority, Base
         return ESP_ERR_INVALID_STATE;
     }
 
+#ifdef CONFIG_DISCRETE_IN_MODE_ANALOG
+    dev->task = xTaskCreateStaticPinnedToCore(
+        discrete_in_analog_task, dev->cfg.name ? dev->cfg.name : "discrete_in",
+        DISCRETE_IN_STACK_WORDS, (void *)dev, priority, dev->stack, &dev->tcb, core_id);
+    if (!dev->task) {
+        ESP_LOGE(TAG, "task creation failed");
+        event_log_error(ERR_SRC_DISCRETE_IN, ERR_CODE_TASK_FAILED, ESP_FAIL, 0);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+#endif
+
     /* Task before ISR handler, not after. The ISR calls
      * vTaskNotifyGiveFromISR(dev->task) -- if the handler were attached
      * first, an edge arriving in the gap would notify a NULL task. */
@@ -288,4 +563,7 @@ void discrete_in_get_diagnostics(discrete_in_handle_t dev, discrete_in_diag_t *o
         return;
     }
     *out = dev->diag;
+#ifdef CONFIG_DISCRETE_IN_MODE_ANALOG
+    out->high = dev->thr.high;
+#endif
 }

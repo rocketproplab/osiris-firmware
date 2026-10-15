@@ -20,7 +20,12 @@
 #define TELEMETRY_QUEUE_DEPTH     48
 
 /* ===================================================================
- *  Downlink over the XBee-PRO S3B, in API mode.
+ *  Downlink over the XBee-PRO S3B, in API mode -- or, as a backup, in
+ *  transparent mode (menuconfig: XBee telemetry link; see the Kconfig).
+ *  Transparent mode writes the same packets as plain bytes instead of
+ *  0x10 frames, and finds uplink packets in the incoming byte stream
+ *  (uplink_stream.h) instead of in 0x90 frames. Everything above the
+ *  UART -- packets, commands, config upload -- is identical.
  *
  *  Shape of the thing:
  *
@@ -233,8 +238,14 @@ typedef struct {
     uint32_t cmds_refused;              // understood, but the state machine said no
     uint32_t bringup_resets;            // hardware resets issued to the module
     uint32_t bootloader_escapes;        // escape sequences sent
-    uint8_t  last_rssi;                 // -dBm magnitude, 0 = unknown
+    uint8_t  last_rssi;                 // -dBm magnitude, 0 = unknown (always 0
+                                        // in transparent mode)
     bool     radio_verified;            // an AT command round-tripped at boot
+    bool     transparent;               // built for transparent mode (AP=0)
+    bool     wrong_mode_detected;       // the module answered in the OTHER mode
+                                        // than this build expects -- see the log
+    uint32_t uplink_discarded_bytes;    // transparent only: DOUT bytes that were
+                                        // not part of a valid uplink packet
 } telemetry_diag_t;
 
 typedef struct telemetry_dev *telemetry_handle_t;

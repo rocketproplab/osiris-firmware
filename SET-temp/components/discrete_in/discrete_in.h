@@ -122,6 +122,13 @@ typedef struct {
                                 // records what the firmware believed about
                                 // provenance rather than leaving it to a
                                 // comment nobody re-reads.
+
+    /* ANALOG MODE ONLY (menuconfig: Discrete inputs -> how a line is
+     * read). Voltages on the BLUE RAVEN side of the divider -- what a
+     * meter on the line reads -- in millivolts. The line counts as FIRED
+     * at or above fire_mv and as idle again at or below release_mv. */
+    uint32_t     fire_mv;
+    uint32_t     release_mv;
 } discrete_in_config_t;
 
 typedef struct {
@@ -133,6 +140,16 @@ typedef struct {
                                 // reading in a flight review even
                                 // though nothing was lost.
     uint64_t first_trigger_us; // ISR-captured time of the FIRST edge
+
+    /* Analog mode only: what the line actually reads, in mV on the Blue
+     * Raven side. idle_mv is a running average while not fired -- the
+     * number to set the thresholds from. */
+    uint32_t last_mv;
+    uint32_t idle_mv;
+    uint32_t peak_mv;          // highest seen since boot
+    uint32_t clipped;          // samples at the ADC's full scale: the line
+                                // is HIGHER than reported (divider bypassed?)
+    bool     high;             // analog mode: the line is FIRED right now
 } discrete_in_diag_t;
 
 /* ===================================================================

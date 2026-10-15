@@ -26,8 +26,120 @@ config DISCRETE_IN_MIN_INTERVAL_MS
 
         0 restores the old accept-everything behaviour.
 
+choice DISCRETE_IN_MODE
+    prompt "How a Blue Raven line is read"
+    default DISCRETE_IN_MODE_ANALOG
+    help
+        ANALOG (default): the ADC reads each line's voltage every
+        DISCRETE_IN_SAMPLE_MS and compares it with this page's thresholds.
+        Needed on this vehicle: the Blue Raven runs from 1S, and with a 2k
+        series resistor its lines measure ~2.86 V idle and 3.7 V fired
+        (2026-10-10). Both are above the digital HIGH level (fixed in the
+        silicon), so a digital input would never see the change.
+
+        DIGITAL: the original GPIO rising-edge interrupt. Exact ISR
+        timestamps, but only works when idle is well below ~0.8 V and
+        fired well above ~2.5 V at the pin.
+
+config DISCRETE_IN_MODE_ANALOG
+    bool "Analog: ADC with voltage thresholds"
+
+config DISCRETE_IN_MODE_DIGITAL
+    bool "Digital: GPIO rising-edge interrupt"
+
+endchoice
+
+config DISCRETE_IN_DIVIDER_TOP_OHMS
+    int "Series resistor, line to pin (ohms)"
+    depends on DISCRETE_IN_MODE_ANALOG
+    range 0 1000000
+    default 2000
+    help
+        R6 (staging) / R9 (recovery). Both lines use the same values.
+        Only used to convert the pin voltage back to the line voltage when
+        there IS a resistor to ground below; with none, the pin sees the
+        line voltage directly (no current flows into the ADC input).
+
+config DISCRETE_IN_DIVIDER_BOTTOM_OHMS
+    int "Resistor, pin to ground (ohms; 0 = none fitted)"
+    depends on DISCRETE_IN_MODE_ANALOG
+    range 0 1000000
+    default 0
+    help
+        R5 (staging) / R8 (recovery). 0 means no resistor to ground: the
+        pin reads the line voltage 1:1, which is the 2k-series setup of
+        2026-10-10.
+
+        The ADC tops out around 3.1 V at the pin. A FIRE threshold must be
+        below that at the pin or it can never be seen -- the boot log says
+        so in red. A fired level ABOVE full scale is fine: it reads as
+        full scale, which is still above the threshold. What must NOT clip
+        is the idle level, or idle and fired look the same.
+
+        CHECK THESE AGAINST A METER: the boot log prints each line's
+        reading at start ("line reads N mV"). With the resistors set
+        right it matches what a meter on the line shows.
+
+config DISCRETE_IN_STAGING_FIRE_MV
+    int "Staging: FIRED at or above (mV on the Blue Raven line)"
+    depends on DISCRETE_IN_MODE_ANALOG
+    range 100 30000
+    default 3000
+    help
+        On the line, where a meter reads it. Default 3.0 V: above the
+        ~2.86 V idle, and 0.7 V below the 3.7 V fired level, so a 1S
+        Blue Raven battery sagging while it drives an e-match is still
+        seen down to 3.0 V.
+
+        The margin that is SMALL is the idle side (~0.14 V). If the idle
+        level creeps up -- a different e-match, a different resistor --
+        check the boot log's reading against this.
+
+config DISCRETE_IN_STAGING_RELEASE_MV
+    int "Staging: idle again at or below (mV on the Blue Raven line)"
+    depends on DISCRETE_IN_MODE_ANALOG
+    range 0 30000
+    default 2950
+    help
+        Below the fire threshold, so noise on a line sitting near one
+        threshold cannot make an edge per wobble (hysteresis). Must stay
+        above the idle level (~2.86 V) or the line can never return to
+        idle after a firing. Clamped to the fire threshold if set above.
+
+config DISCRETE_IN_RECOVERY_FIRE_MV
+    int "Recovery: FIRED at or above (mV on the Blue Raven line)"
+    depends on DISCRETE_IN_MODE_ANALOG
+    range 100 30000
+    default 3000
+
+config DISCRETE_IN_RECOVERY_RELEASE_MV
+    int "Recovery: idle again at or below (mV on the Blue Raven line)"
+    depends on DISCRETE_IN_MODE_ANALOG
+    range 0 30000
+    default 2950
+
+config DISCRETE_IN_SAMPLE_MS
+    int "Sample period (ms)"
+    depends on DISCRETE_IN_MODE_ANALOG
+    range 1 50
+    default 2
+    help
+        How often each line is read. Sets the timestamp resolution of a
+        detected firing, together with the confirm count below.
+
+config DISCRETE_IN_CONFIRM_SAMPLES
+    int "Consecutive samples needed to change state"
+    depends on DISCRETE_IN_MODE_ANALOG
+    range 1 50
+    default 3
+    help
+        A firing is believed after this many samples in a row at or above
+        the fire threshold (6 ms at the defaults). The recorded time is
+        that of the FIRST of them.
+
 config DISCRETE_IN_INTERNAL_PULLDOWN
     bool "Enable the internal pulldown on discrete inputs"
+    depends on DISCRETE_IN_MODE_DIGITAL
     default n
     help
         OFF for flight, and for any build running on PCB v1.

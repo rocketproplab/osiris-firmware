@@ -64,6 +64,12 @@ typedef struct {
     uint32_t irq_count;
     uint32_t irq_timeouts;
     uint32_t liftoff_events;   // INT2 edges seen
+    /* Contact with the chip -- see sensor_health.h. */
+    bool     lost;             // true right now: not publishing, retrying
+    uint32_t lost_count;       // times contact was lost
+    uint32_t recoveries;       // times it came back
+    uint32_t retry_attempts;   // re-init attempts across all outages
+    uint32_t last_outage_ms;   // length of the most recent outage
 } lsm6dsox_diag_t;
 
 /* ===================================================================

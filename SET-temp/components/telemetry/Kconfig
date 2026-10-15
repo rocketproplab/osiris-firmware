@@ -1,0 +1,65 @@
+menu "XBee telemetry link"
+
+    choice TELEMETRY_XBEE_MODE
+        prompt "XBee serial mode"
+        default TELEMETRY_XBEE_API
+        help
+            How the flight computer talks to the XBee over the UART. This
+            must match the AP setting stored IN THE MODULE (set it with
+            XCTU). The firmware never changes AP itself.
+
+            This is the VEHICLE radio only. The ground radio can be in
+            either mode, independently: the RF bytes on the air are the
+            same. Tell the ground station which (--transparent, or the
+            "transparent radio" box).
+
+        config TELEMETRY_XBEE_API
+            bool "API mode (AP=1) -- normal"
+            help
+                Every packet goes out in a 0x10 frame and every uplink
+                command arrives in a 0x90 frame. Gives the boot-time ATVR
+                check, the once-a-second ATDB uplink RSSI, and delivery
+                status for unicast packets.
+
+        config TELEMETRY_XBEE_TRANSPARENT
+            bool "Transparent mode (AP=0) -- backup"
+            help
+                The packets are written to the UART as plain bytes and the
+                module sends them to its stored destination (DH/DL; the
+                factory default is broadcast). Uplink packets are found in
+                the incoming byte stream by their magic byte, length and
+                CRC.
+
+                What you lose: the uplink RSSI field reads 0 (unknown), no
+                delivery status, so no firmware retries (the radio's own
+                MAC retries still apply), and the destination comes from
+                the module, not the firmware. Packet format, commands and
+                config upload are unchanged.
+
+                Module settings (XCTU): AP=0, BD=115200 (or whatever this
+                board uses), DH/DL = the ground radio or broadcast, and
+                leave RO (packetization timeout) at its default.
+    endchoice
+
+    config TELEMETRY_XBEE_TRANSPARENT_VERIFY
+        bool "Check the radio at boot with +++ / ATVR"
+        depends on TELEMETRY_XBEE_TRANSPARENT
+        default y
+        help
+            Enters command mode once at boot (guard time, +++, ATVR, ATDH,
+            ATDL, ATCN) to prove a radio is there and log where it will
+            send. Costs about 2.5 s of boot time. Without it the radio is
+            reported as unverified (STATUS_FLAG_TELEM_OK clear) and
+            telemetry is sent blind.
+
+    config TELEMETRY_XBEE_GUARD_MS
+        int "Command-mode guard time (ms)"
+        depends on TELEMETRY_XBEE_TRANSPARENT_VERIFY
+        range 100 5000
+        default 1100
+        help
+            Silence held before and after +++. Must be LONGER than the
+            module's GT setting (default 1000 ms). If you shorten GT in
+            XCTU, you can shorten this to match and save boot time.
+
+endmenu

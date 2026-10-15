@@ -7,6 +7,14 @@ live from the ground station's radio.
     python3 decode_telemetry.py capture.bin --stdout
     python3 decode_telemetry.py --port COM5           # live, Ctrl-C to stop
     python3 decode_telemetry.py --port /dev/ttyUSB0 --raw flight.bin
+    python3 decode_telemetry.py vehicle_uart.bin --transparent
+
+--transparent means the bytes carry NO XBee frames: a capture of the
+vehicle's UART with its radio in transparent mode (menuconfig -> XBee
+telemetry link), or a ground radio set to AP=0. Packets are then found by
+magic, length and CRC (downlink_stream.py). Without it, 0x90/0x10 payloads
+that are not exactly one packet -- a transparent-mode vehicle radio can
+split or merge them -- are reassembled the same way.
 
 Live mode prints a one-line vehicle summary that refreshes in place, and
 on Ctrl-C writes the same CSVs the file mode does. --raw also appends
@@ -38,6 +46,8 @@ import sys
 import time
 from collections import defaultdict
 
+from downlink_stream import DownlinkStream, is_whole_packet
+
 # Kept in step with sensor_records.h and telemetry.h by hand.
 STREAMS = {
     0: ("baro",  "<IQfff",     ["seq", "timestamp_us", "pressure_pa",
@@ -66,7 +76,9 @@ EVENT_TYPES = ["NONE", "BOOT", "SD_MOUNTED", "STAGING_SIGNAL", "RECOVERY_SIGNAL"
                "LIFTOFF_HW", "LIFTOFF_SW", "APOGEE", "DEPLOY_ARMED", "DEPLOY_PREDICTED",
                "MODE_CHANGED", "LANDED", "UPLINK_COMMAND", "UPLINK_REJECTED",
                "BURN_START", "BURN_END", "SD_UNMOUNTED",
-               "CONFIG_RX", "CONFIG_STORED", "CONFIG_REJECTED", "CONFIG_APPLIED"]
+               "CONFIG_RX", "CONFIG_STORED", "CONFIG_REJECTED", "CONFIG_APPLIED",
+               "SENSOR_LOST", "SENSOR_RECOVERED",
+               "IMU_FAILOVER", "ALT_SOURCE", "VEL_SOURCE"]
 MODES = ["STANDBY", "ARMED", "FLIGHT", "LANDED"]
 MODE_SRC = ["NONE", "UPLINK", "IMU_WAKEUP", "FLIGHT_LOGIC", "BOOT", "TEST"]
 ENUM_COLUMNS = {4: {"source": ERR_SOURCES, "code": ERR_CODES},
@@ -152,6 +164,15 @@ def iter_api_frames(blob):
     out = list(p.feed(blob))
     iter_api_frames.stats = p.stats
     return out
+
+
+def payload_packets(dls, payload, now=None):
+    """One frame's payload -> the packets in it. Normally the payload IS
+    one packet and passes straight through, so a CRC failure is still
+    counted as one; anything else goes through the reassembler."""
+    if not dls.pending and is_whole_packet(payload):
+        return [payload]
+    return dls.feed(payload, now)
 
 
 def parse_packet(pkt):
@@ -264,7 +285,7 @@ class LiveState:
                     _fmt_age(age), stale))
 
 
-def run_live(port, baud, rows, raw_path=None, quiet=False):
+def run_live(port, baud, rows, raw_path=None, quiet=False, transparent=False):
     try:
         import serial                          # pyserial
     except ImportError:
@@ -272,12 +293,16 @@ def run_live(port, baud, rows, raw_path=None, quiet=False):
         return 2
 
     parser = ApiFrameParser()
+    dls = DownlinkStream()
     st = LiveState()
     raw = open(raw_path, "ab") if raw_path else None
 
     print("listening on %s @ %d baud -- Ctrl-C to stop and write CSVs" % (port, baud))
-    print("(the radio must be in API mode AP=1 on the same network ID and "
-          "preamble as the vehicle)")
+    if transparent:
+        print("(--transparent: raw packets, no XBee frames -- radio at AP=0)")
+    else:
+        print("(the radio must be in API mode AP=1 on the same network ID and "
+              "preamble as the vehicle)")
     last_draw = 0.0
     try:
         with serial.Serial(port, baud, timeout=0.2) as ser:
@@ -287,11 +312,17 @@ def run_live(port, baud, rows, raw_path=None, quiet=False):
                     if raw:
                         raw.write(data)
                         raw.flush()
-                    for ftype, frame in parser.feed(data):
-                        off = PAYLOAD_OFFSET.get(ftype)
-                        if off is None or len(frame) <= off:
-                            continue
-                        parsed = parse_packet(frame[off:])
+                    now = time.time()
+                    if transparent:
+                        pkts = dls.feed(data, now)
+                    else:
+                        pkts = []
+                        for ftype, frame in parser.feed(data):
+                            off = PAYLOAD_OFFSET.get(ftype)
+                            if off is not None and len(frame) > off:
+                                pkts += payload_packets(dls, frame[off:], now)
+                    for pkt in pkts:
+                        parsed = parse_packet(pkt)
                         if parsed is None:
                             st.bad_crc += 1
                             continue
@@ -384,11 +415,13 @@ def main(argv):
     port = _opt(argv, "--port")
     baud = int(_opt(argv, "--baud", "115200"))
     raw_path = _opt(argv, "--raw")
+    transparent = "--transparent" in argv
 
     rows = defaultdict(list)
 
     if port:
-        rc = run_live(port, baud, rows, raw_path=raw_path, quiet=quiet)
+        rc = run_live(port, baud, rows, raw_path=raw_path, quiet=quiet,
+                      transparent=transparent)
         if rc == 0:
             write_outputs(rows, to_stdout)
         return rc
@@ -408,30 +441,43 @@ def main(argv):
     packets = good = bad_crc = retransmits = 0
     seqs = []
 
+    dls = DownlinkStream()
+    candidates = []
     for path in paths:
         blob = open(path, "rb").read()
+        if transparent:
+            candidates += dls.feed(blob) + dls.flush()
+            continue
         for ftype, frame in iter_api_frames(blob):
             off = PAYLOAD_OFFSET.get(ftype)
             if off is None or len(frame) <= off:
                 continue
             # 0x90: type, src64[8], reserved[2], options, data...
             # 0x10: type, frame_id, dest64[8], dest16[2], radius, options, data...
-            parsed = parse_packet(frame[off:])
-            packets += 1
-            if parsed is None:
-                bad_crc += 1
-                continue
-            good += 1
-            hdr, recs = parsed
-            seqs.append(hdr["seq"])
-            if hdr["retransmit"]:
-                retransmits += 1
-            for sid, vals in recs:
-                rows[sid].append([hdr["seq"], hdr["rssi_dbm"]] + vals)
+            candidates += payload_packets(dls, frame[off:])
+        candidates += dls.flush()
+
+    for pkt in candidates:
+        parsed = parse_packet(pkt)
+        packets += 1
+        if parsed is None:
+            bad_crc += 1
+            continue
+        good += 1
+        hdr, recs = parsed
+        seqs.append(hdr["seq"])
+        if hdr["retransmit"]:
+            retransmits += 1
+        for sid, vals in recs:
+            rows[sid].append([hdr["seq"], hdr["rssi_dbm"]] + vals)
 
     stats = getattr(iter_api_frames, "stats", {})
-    print("api frames        : %d (bad checksum %d)" %
-          (stats.get("frames", 0), stats.get("bad_checksum", 0)))
+    if not transparent:
+        print("api frames        : %d (bad checksum %d)" %
+              (stats.get("frames", 0), stats.get("bad_checksum", 0)))
+    if dls.stats["packets"] or dls.stats["discarded_bytes"]:
+        print("reassembled       : %d packets from a byte stream, %d bytes discarded" %
+              (dls.stats["packets"], dls.stats["discarded_bytes"]))
     print("telemetry packets : %d ok, %d failed CRC, %d retransmits" %
           (good, bad_crc, retransmits))
 

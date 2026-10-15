@@ -11,6 +11,12 @@
 #include "data_router.h"
 #include "flight_mode.h"
 #include "event_log.h"
+#include "sensor_health.h"
+#include "adc1_shared.h"
+
+/* Consecutive failed samples (every ADC conversion in the set failed)
+ * before the monitor reports itself lost: half a second in flight. */
+#define BATTERY_LOST_AFTER_FAILS  5
 
 static const char *TAG = "BATTERY";
 
@@ -41,6 +47,9 @@ struct battery_dev {
 
     portMUX_TYPE          diag_lock;
     battery_diag_t        diag;
+
+    sensor_health_t       health;       /* touched only by battery_task */
+    uint32_t              consec_fails;
 };
 
 static struct battery_dev s_pool[BATTERY_MAX_INSTANCES];
@@ -63,7 +72,7 @@ static esp_err_t battery_sample(struct battery_dev *dev, float *pin_v, float *pa
 
     for (uint8_t i = 0; i < n; i++) {
         int raw = 0;
-        if (adc_oneshot_read(dev->adc, dev->cfg.channel, &raw) == ESP_OK) {
+        if (adc1_shared_read(dev->cfg.channel, &raw) == ESP_OK) {
             accum += raw;
             good++;
         }
@@ -75,6 +84,20 @@ static esp_err_t battery_sample(struct battery_dev *dev, float *pin_v, float *pa
 
     int mean_raw = (int)(accum / good);
     int mv = 0;
+
+    /* Within a few counts of the 12-bit ceiling: the pin is at or past
+     * full scale and every volt above it is invisible. Counted, and
+     * said once, rather than logged per sample at 10 Hz. */
+    if (mean_raw >= 4095 - 4) {
+        portENTER_CRITICAL(&dev->diag_lock);
+        uint32_t first = (dev->diag.clipped++ == 0);
+        portEXIT_CRITICAL(&dev->diag_lock);
+        if (first) {
+            ESP_LOGE(TAG, "ADC at full scale: the pack is ABOVE what this divider "
+                          "can read -- battery_v is a floor, not a measurement");
+            event_log_error(ERR_SRC_BATTERY, ERR_CODE_OVERFLOW, ESP_OK, (uint32_t)mean_raw);
+        }
+    }
 
     if (dev->cali_enabled) {
         esp_err_t err = adc_cali_raw_to_voltage(dev->cali, mean_raw, &mv);
@@ -94,9 +117,10 @@ static esp_err_t battery_sample(struct battery_dev *dev, float *pin_v, float *pa
     float ratio = dev->cfg.divider_ratio > 0.0f
                     ? dev->cfg.divider_ratio
                     : BATTERY_DIVIDER_RATIO_V1;
+    float gain  = dev->cfg.gain > 0.0f ? dev->cfg.gain : 1.0f;
 
     *pin_v  = (float)mv / 1000.0f;
-    *pack_v = *pin_v / ratio;
+    *pack_v = (*pin_v / ratio) * gain + dev->cfg.offset_v;
     return ESP_OK;
 }
 
@@ -168,13 +192,26 @@ static void battery_task(void *arg)
 
     while (dev->task_should_run) {
         float pin_v = 0.0f, pack_v = 0.0f;
+        uint64_t now_us = (uint64_t)esp_timer_get_time();
         if (battery_sample(dev, &pin_v, &pack_v) == ESP_OK) {
+            dev->consec_fails = 0;
+            if (dev->health.lost) {
+                sensor_health_retry_result(&dev->health, true, now_us);
+            }
             battery_record_sample(dev, pin_v, pack_v);
         } else {
             portENTER_CRITICAL(&dev->diag_lock);
-            dev->diag.read_errors++;
-            event_log_error(ERR_SRC_BATTERY, ERR_CODE_READ_FAILED, ESP_FAIL, dev->diag.read_errors);
+            uint32_t errs = ++dev->diag.read_errors;
             portEXIT_CRITICAL(&dev->diag_lock);
+            /* Recorded OUTSIDE the critical section: event_log ends in a
+             * ring-buffer push that takes its own spinlock, and nesting
+             * the two is the lock-ordering hazard the rest of the code
+             * avoids. (It used to be inside.) */
+            event_log_error(ERR_SRC_BATTERY, ERR_CODE_READ_FAILED, ESP_FAIL, errs);
+            if (++dev->consec_fails >= BATTERY_LOST_AFTER_FAILS) {
+                sensor_health_lost(&dev->health, SENSOR_LOST_BUS_ERROR, now_us);
+            }
+            sensor_health_poll(&dev->health, now_us);
         }
         /* Re-derive the period when the mode changes. vTaskDelayUntil
          * keeps the cadence honest within a mode; this is what makes the
@@ -228,13 +265,12 @@ esp_err_t battery_init(const battery_config_t *cfg, battery_handle_t *out)
     dev->diag_lock   = tmp_b;
     dev->cfg         = *cfg;
 
-    adc_oneshot_unit_init_cfg_t unit_cfg = {
-        .unit_id  = ADC_UNIT_1,        /* GPIO20 is ADC1_CH4 -- fixed by silicon */
-        .ulp_mode = ADC_ULP_MODE_DISABLE,
-    };
-    esp_err_t err = adc_oneshot_new_unit(&unit_cfg, &dev->adc);
+    /* GPIO20 is ADC1_CH4 -- fixed by silicon. ADC1 is shared with the
+     * Blue Raven lines in analog mode, so the unit comes from
+     * adc1_shared rather than being created (and owned) here. */
+    esp_err_t err = adc1_shared_get(&dev->adc);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "adc_oneshot_new_unit failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "ADC1 unavailable: %s", esp_err_to_name(err));
         dev->in_use = false;
         return err;
     }
@@ -243,10 +279,9 @@ esp_err_t battery_init(const battery_config_t *cfg, battery_handle_t *out)
         .atten    = BATTERY_ADC_ATTEN,
         .bitwidth = BATTERY_ADC_BITWIDTH,
     };
-    err = adc_oneshot_config_channel(dev->adc, dev->cfg.channel, &chan_cfg);
+    err = adc1_shared_config_channel(dev->cfg.channel, &chan_cfg);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "adc_oneshot_config_channel failed: %s", esp_err_to_name(err));
-        adc_oneshot_del_unit(dev->adc);
+        ESP_LOGE(TAG, "adc channel config failed: %s", esp_err_to_name(err));
         dev->in_use = false;
         return err;
     }
@@ -277,8 +312,29 @@ esp_err_t battery_init(const battery_config_t *cfg, battery_handle_t *out)
     float ratio = dev->cfg.divider_ratio > 0.0f
                     ? dev->cfg.divider_ratio
                     : BATTERY_DIVIDER_RATIO_V1;
-    ESP_LOGI(TAG, "battery monitor on ADC1_CH%d, divider %.4f (full scale %.2f V)",
-             (int)dev->cfg.channel, ratio, 3.3f / ratio);
+    float gain  = dev->cfg.gain > 0.0f ? dev->cfg.gain : 1.0f;
+    float full_scale_pack = (BATTERY_ADC_FULL_SCALE_V / ratio) * gain + dev->cfg.offset_v;
+    ESP_LOGI(TAG, "battery monitor on ADC1_CH%d, divider %.4f, gain %.4f, offset %+.3f V "
+                  "(reads up to ~%.2f V)",
+             (int)dev->cfg.channel, ratio, gain, dev->cfg.offset_v, full_scale_pack);
+
+    /* The one mistake a resistor swap makes silently: a divider whose
+     * ratio is too large for the pack. The pin then sits at or above
+     * full scale for the whole flight, every reading is the same wrong
+     * number, and the pin is outside the chip's ratings. Loud, but not
+     * fatal -- a bad battery reading is no reason to refuse to fly. */
+    if (dev->cfg.max_pack_volts > 0.0f) {
+        float pin_at_max = dev->cfg.max_pack_volts * ratio;
+        if (pin_at_max > BATTERY_ADC_FULL_SCALE_V) {
+            ESP_LOGE(TAG, "DIVIDER TOO WEAK: a %.2f V pack puts %.2f V on the pin; the ADC "
+                          "tops out at ~%.1f V. Readings will clip at ~%.2f V%s",
+                     dev->cfg.max_pack_volts, pin_at_max, BATTERY_ADC_FULL_SCALE_V,
+                     full_scale_pack,
+                     pin_at_max > 3.3f ? ", and the pin is ABOVE the 3.3 V supply" : "");
+            event_log_error(ERR_SRC_BATTERY, ERR_CODE_CONFIG_INVALID, ESP_OK,
+                            (uint32_t)(pin_at_max * 1000.0f));
+        }
+    }
     return ESP_OK;
 }
 
@@ -293,6 +349,8 @@ esp_err_t battery_start(battery_handle_t dev, UBaseType_t priority, BaseType_t c
     }
 
     dev->task_should_run = true;
+    dev->consec_fails = 0;
+    sensor_health_init(&dev->health, ERR_SRC_BATTERY, (uint64_t)esp_timer_get_time());
     dev->task = xTaskCreateStaticPinnedToCore(
         battery_task, "battery", BATTERY_STACK_WORDS,
         (void *)dev, priority, dev->stack, &dev->tcb, core_id);
@@ -323,7 +381,7 @@ esp_err_t battery_stop(battery_handle_t dev)
     }
 #endif
     if (dev->adc) {
-        adc_oneshot_del_unit(dev->adc);
+        /* Shared unit (adc1_shared): never deleted by one of its users. */
         dev->adc = NULL;
     }
 

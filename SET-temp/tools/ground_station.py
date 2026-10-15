@@ -8,9 +8,18 @@ ground_station.py -- the laptop end of the Osiris downlink and uplink.
     python tools/ground_station.py --port COM5 --headless           # terminal only
     python tools/ground_station.py --replay sessions/<dir>/raw.bin --headless
 
-It always speaks real XBee API mode 1 to whatever the port string opens.
+By default it speaks XBee API mode 1 to whatever the port string opens.
 A COM port is a real ground radio; socket://... is the link emulator. Nothing
 else differs, so moving from the emulator to a second radio changes one string.
+
+    python tools/ground_station.py --port COM5 --transparent       # ground radio at AP=0
+
+--transparent (or the GUI's "transparent radio" box) is for a ground radio
+set to AP=0. Packets then go to the radio as plain bytes, and are found in
+what comes back by magic, length and CRC. The vehicle radio can be in either
+mode; that is the firmware's setting (menuconfig -> XBee telemetry link).
+In transparent mode there is no downlink RSSI and no per-command delivery
+status, and the uplink goes to the radio's own DH/DL, not --dest.
 
 Single source of truth
 ----------------------
@@ -54,6 +63,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import decode_logs as dl                                    # noqa: E402
 import uplink_command as up                                 # noqa: E402
 from xbee_api import BROADCAST, FrameParser, build_frame    # noqa: E402
+from downlink_stream import DownlinkStream, is_whole_packet  # noqa: E402
 
 PKT_MAGIC = 0xA5
 PKT_VERSION = 1
@@ -92,6 +102,31 @@ STATUS_FLAG_NAMES = {
 # Must match CFG_REJECT_* in sensor_records.h. Each reason wants a
 # different response, which is why the firmware does not collapse them
 # into one "it failed" code.
+# EV_SENSOR_LOST's detail field -- sensor_lost_reason_t in
+# components/sensor_health/sensor_health.h. Hand-maintained, like the
+# other enum tables here; an unknown value is shown as a number.
+# EV_VEL_SOURCE's channel -- deploy_vel_source_t in flight_logic.h. Also
+# what EV_APOGEE's channel means: which sensor called apogee.
+VEL_SOURCE_NAMES = {
+    0: "the BAROMETER",
+    1: "GPS (barometer and IMU both silent)",
+    2: "NOTHING -- velocity, apogee and PINC unavailable",
+    3: "the IMU (barometer silent; altitude from GPS)",
+}
+
+# EV_ALT_SOURCE's channel -- deploy_alt_source_t in flight_logic.h.
+ALT_SOURCE_NAMES = {
+    0: "the BAROMETER",
+    1: "GPS (barometer silent)",
+    2: "NOTHING -- barometer and GPS both unavailable; altitude events read false",
+}
+
+SENSOR_LOST_REASONS = {
+    1: "no response: unplugged, a wire open, or unpowered",
+    2: "chip reset: it lost power and came back unconfigured",
+    3: "read errors: the bus or ADC is refusing every read",
+}
+
 CFG_REJECT_NAMES = {
     1: "chunks were lost",
     2: "the bytes arrived corrupted",
@@ -483,13 +518,28 @@ class GroundStation:
     owns the station (the GUI's timer or the headless loop), so nothing
     needs a lock."""
 
-    def __init__(self, out_dir=None, dest=BROADCAST, capture=True, seq_path=None):
+    def __init__(self, out_dir=None, dest=BROADCAST, capture=True, seq_path=None,
+                 transparent=False):
         self.dest = dest
+        # The GROUND radio at AP=0: no frames either way. See the module
+        # docstring.
+        self.transparent = transparent
         self.ser = None
         self.port_name = None
         self.inbox = queue.Queue()
         self.reader = None
         self.parser = FrameParser()
+        # Packets split or merged across 0x90 frames -- which happens when
+        # the VEHICLE radio runs in transparent mode -- are put back
+        # together here. See downlink_stream.py.
+        self.dl_stream = DownlinkStream()
+        # Wrong-mode detectors: each watches for the OTHER mode's traffic.
+        # In API mode, telemetry packets hiding in the "junk" mean the radio
+        # is really at AP=0; in transparent mode, valid 0x90 frames mean it
+        # is really at AP=1. Either way the operator is told once.
+        self._other_mode_stream = DownlinkStream()
+        self._other_mode_parser = FrameParser()
+        self._wrong_mode_warned = False
         self.seq = SeqTracker()
         self.seq_counter = up.SeqCounter(seq_path)
         self.messages = collections.deque()
@@ -604,16 +654,26 @@ class GroundStation:
             self._raw = None
 
     # ------------------------------------------------------------ connection
-    def connect(self, port, baud=115200):
+    def connect(self, port, baud=115200, transparent=None):
         import serial
         self.disconnect()
+        if transparent is not None:
+            self.transparent = bool(transparent)
         self.ser = serial.serial_for_url(port, baudrate=baud, timeout=0.05)
         self.port_name = port
         self.connected_at = time.time()
         self.parser = FrameParser()
+        self.dl_stream = DownlinkStream()
+        self._other_mode_stream = DownlinkStream()
+        self._other_mode_parser = FrameParser()
+        self._wrong_mode_warned = False
         self.reader = threading.Thread(target=self._read_loop, args=(self.ser,), daemon=True)
         self.reader.start()
-        self.note(f"connected to {port} @ {baud}")
+        mode = "TRANSPARENT (AP=0)" if self.transparent else "API (AP=1)"
+        self.note(f"connected to {port} @ {baud}, ground radio in {mode} mode")
+        if self.transparent and self.dest != BROADCAST:
+            self.note(f"--dest {self.dest:016X} is ignored in transparent mode: the ground "
+                      f"radio's own DH/DL decide where uplink goes", "warn")
 
     def disconnect(self):
         ser, self.ser = self.ser, None
@@ -650,19 +710,30 @@ class GroundStation:
         self.ser.write(frame)
 
     # ---------------------------------------------------------------- uplink
+    def _uplink_bytes(self, payload):
+        """What goes to the port for one uplink packet: a 0x10 frame, or in
+        transparent mode the packet itself. Returns (bytes, frame id or None)."""
+        if self.transparent:
+            return payload, None
+        fid = self._next_fid()
+        return up.xbee_tx_request(payload, self.dest, fid), fid
+
     def send_command(self, name, arg=0):
         opcode = up.COMMANDS[name]
         seq = self.seq_counter.next()
         payload = up.build_command(opcode, seq, arg)
-        fid = self._next_fid()
-        self._write(up.xbee_tx_request(payload, self.dest, fid))
+        wire, fid = self._uplink_bytes(payload)
+        self._write(wire)
         info = {"name": name.upper(), "opcode": opcode, "seq": seq, "arg": arg,
                 "sent": time.time()}
-        self.pending_tx[fid] = info
+        if fid is not None:
+            self.pending_tx[fid] = info
         self.awaiting_ack.append(info)
         self.stats["cmds_sent"] += 1
         extra = f" arg={arg}" if name == "mark" else ""
-        self.note(f"sent {info['name']} seq={seq}{extra}", "cmd")
+        how = " (transparent: no delivery report -- watch for the vehicle's " \
+              "UPLINK_COMMAND event)" if self.transparent else ""
+        self.note(f"sent {info['name']} seq={seq}{extra}{how}", "cmd")
         return seq
 
     # ------------------------------------------------------------- config
@@ -673,9 +744,10 @@ class GroundStation:
         drained one per poll(). The vehicle answers with CONFIG_STORED or
         CONFIG_REJECTED once the commit lands -- see _on_event."""
         packets, crc, chunks = up.config_packets(text, self.seq_counter.next)
-        for i, payload in enumerate(packets):
-            self.tx_queue.append(up.xbee_tx_request(payload, self.dest, self._next_fid()))
-            del i
+        # Still paced one packet per poll in transparent mode: the gap is
+        # also what makes the radio cut each one into its own RF packet.
+        for payload in packets:
+            self.tx_queue.append(self._uplink_bytes(payload)[0])
         self.upload = {"sent": 0, "total": len(packets), "chunks": chunks,
                        "crc": crc, "bytes": len(text.encode("utf-8")),
                        "started": time.time(), "verdict": None}
@@ -753,6 +825,10 @@ class GroundStation:
                 continue
             self.feed(item)
         self._pump_tx()
+        # A packet split across radio frames whose second half never came
+        # is given up after a second, so it cannot delay the next one.
+        for pkt in self.dl_stream.expire(time.time()):
+            self._on_packet(pkt, time.time())
         # A replay advances on the GUI tick, not on packet arrival, so it
         # plays at the right rate on a silent link -- which is the usual
         # case when somebody is simulating.
@@ -760,7 +836,11 @@ class GroundStation:
         # ATDB on the ground radio measures the downlink. Only worth asking
         # once something has been heard.
         now = time.time()
-        if self.connected and self.last_packet_rx and now - self.last_db_poll > 1.0:
+        # Transparent: asking would mean +++ command mode on the ground
+        # radio, a second of silence either side, uplink blocked. Not worth
+        # it for a number; the downlink RSSI simply shows "--".
+        if (self.connected and not self.transparent and self.last_packet_rx
+                and now - self.last_db_poll > 1.0):
             self.last_db_poll = now
             try:
                 self._poll_ground_rssi()
@@ -771,18 +851,59 @@ class GroundStation:
     def feed(self, chunk, rx_time=None):
         rx_time = rx_time if rx_time is not None else time.time()
         self._capture_raw(chunk)
+        if self.transparent:
+            for pkt in self.dl_stream.feed(chunk, rx_time):
+                self._on_packet(pkt, rx_time)
+            self.stats["junk_bytes"] = self.dl_stream.stats["discarded_bytes"]
+            self._check_other_mode_api(chunk)
+            return
         for kind, data in self.parser.feed(chunk):
             if kind == "frame":
                 self._on_frame(data, rx_time)
             elif kind == "junk":
                 self.stats["junk_bytes"] += len(data)
+                self._check_other_mode_raw(data, rx_time)
             else:
                 self.stats["bad_frames"] += 1
+                self._check_other_mode_raw(data[:1], rx_time)
+
+    def _warn_wrong_mode(self, text):
+        if not self._wrong_mode_warned:
+            self._wrong_mode_warned = True
+            self.note(text, "error", key="ground-wrong-mode")
+
+    def _check_other_mode_raw(self, data, rx_time):
+        """API mode, bytes that are not frames. If they hold valid telemetry
+        packets, the ground radio is really at AP=0: decode them anyway, and
+        say so -- uplink will NOT work until the setting matches, because a
+        0x10 frame sent to a transparent radio goes out as plain bytes."""
+        for pkt in self._other_mode_stream.feed(data, rx_time):
+            self.stats["wrong_mode_packets"] += 1
+            self._warn_wrong_mode(
+                "ground radio is sending PLAIN telemetry packets, not API frames: it is in "
+                "TRANSPARENT mode (AP=0). Reconnect with 'transparent radio' ticked "
+                "(--transparent), or set AP=1 in XCTU. Downlink is being decoded anyway; "
+                "uplink commands will not work until they match.")
+            self._on_packet(pkt, rx_time)
+
+    def _check_other_mode_api(self, chunk):
+        """Transparent mode. Valid 0x90 Receive Packet frames mean the radio
+        is really at AP=1. (The telemetry inside them still decodes, by
+        luck of the byte-stream search; the uplink does not.)"""
+        for kind, data in self._other_mode_parser.feed(chunk):
+            if kind == "frame" and data[0] in (0x90, 0x8A, 0x88, 0x8B):
+                self.stats["wrong_mode_frames"] += 1
+                if self.stats["wrong_mode_frames"] >= 2:
+                    self._warn_wrong_mode(
+                        "ground radio is sending XBee API FRAMES: it is in API mode (AP=1), "
+                        "but the station is set to transparent. Reconnect with 'transparent "
+                        "radio' unticked, or set AP=0 in XCTU. Uplink commands will not "
+                        "work until they match.")
 
     def _on_frame(self, f, rx_time):
         t = f[0]
         if t == 0x90 and len(f) >= 12:
-            self._on_packet(f[12:], rx_time)
+            self._on_rf_payload(f[12:], rx_time)
         elif t == 0x8B and len(f) >= 7:
             self._on_tx_status(f[1], f[5])
         elif t == 0x88 and len(f) >= 5:
@@ -794,6 +915,24 @@ class GroundStation:
             self.note(f"ground radio modem status 0x{f[1]:02X}")
         else:
             self.stats["other_frames"] += 1
+
+    def _on_rf_payload(self, payload, rx_time):
+        """One 0x90 payload. Normally exactly one packet (vehicle radio in
+        API mode), decoded as is -- a CRC failure is reported as one. If
+        it is not one whole packet, or part of an earlier one is still
+        waiting, it goes through the reassembler instead."""
+        if not self.dl_stream.pending and is_whole_packet(payload):
+            self._on_packet(payload, rx_time)
+            return
+        if not self.stats["reassembled_payloads"]:
+            self.note("downlink packets are arriving split or merged across radio "
+                      "frames -- expected if the vehicle radio is in TRANSPARENT mode; "
+                      "reassembling them", "warn", key="dl-reassembly")
+        self.stats["reassembled_payloads"] += 1
+        before = self.dl_stream.stats["discarded_bytes"]
+        for pkt in self.dl_stream.feed(payload, rx_time):
+            self._on_packet(pkt, rx_time)
+        self.stats["stream_discarded_bytes"] += self.dl_stream.stats["discarded_bytes"] - before
 
     def _on_tx_status(self, fid, status):
         info = self.pending_tx.pop(fid, None)
@@ -963,6 +1102,51 @@ class GroundStation:
         elif typ == "CONFIG_APPLIED":
             self.config_status = ("applied", rec["detail"])
             self.note("vehicle APPLIED the stored config -- it is live now", "event")
+            return
+        elif typ == "SENSOR_LOST":
+            # channel = err_source_t, detail = sensor_lost_reason_t
+            # (components/sensor_health/sensor_health.h).
+            src = dl._name(dl.ERR_SOURCES, rec["channel"])
+            why = SENSOR_LOST_REASONS.get(rec["detail"], f"reason {rec['detail']}")
+            # Re-sent by the vehicle every 5 s while the sensor stays lost
+            # (the downlink has no acks, and a sensor missing at boot is
+            # declared before the radio is up). Keyed per sensor, so the
+            # repeats collapse into one line with a count.
+            self.note(f"vehicle LOST CONTACT with {src} ({why}) -- no data from it; "
+                      f"the vehicle keeps trying and will say RECOVERED", "error",
+                      key=f"sensor-lost-{rec['channel']}")
+            return
+        elif typ == "IMU_FAILOVER":
+            # channel 1: IMU silent past the failover time; 0: it is back.
+            if rec["channel"]:
+                self.note(f"vehicle flight logic: IMU SILENT {rec['detail'] / 1000:.1f} s -- "
+                          f"apogee and recovery now run on altitude alone; tilt/burn "
+                          f"conditions block unless the channel ignores them", "error",
+                          key="imu-failover")
+            else:
+                self.note(f"vehicle flight logic: IMU back after {rec['detail'] / 1000:.1f} s "
+                          f"(tilt stays invalid if this happened after liftoff)", "event")
+            return
+        elif typ == "ALT_SOURCE":
+            src = ALT_SOURCE_NAMES.get(rec["channel"], f"source {rec['channel']}")
+            level = "event" if rec["channel"] == 0 else "error"
+            self.note(f"vehicle flight logic: altitude now from {src}", level,
+                      key="alt-source")
+            return
+        elif typ == "VEL_SOURCE":
+            src = VEL_SOURCE_NAMES.get(rec["channel"], f"source {rec['channel']}")
+            level = "event" if rec["channel"] == 0 else "error"
+            self.note(f"vehicle flight logic: velocity / apogee / descending now from {src}",
+                      level, key="vel-source")
+            return
+        elif typ == "LIFTOFF_SW" and rec["channel"] == 1:
+            self.note("vehicle LIFTOFF detected from ALTITUDE (IMU silent) -- "
+                      "marked late, tilt unavailable this flight", "event")
+            return
+        elif typ == "SENSOR_RECOVERED":
+            src = dl._name(dl.ERR_SOURCES, rec["channel"])
+            self.note(f"vehicle RECOVERED {src} after {rec['detail'] / 1000:.2f} s "
+                      f"without it", "event")
             return
         self.note(text, "event")
 
@@ -1217,7 +1401,7 @@ def blank_config():
     blank slate that happens to do nothing."""
     return {"channels": {name: {"primary": {}, "secondary": {}, "thresholds": {},
                                 "latch": False, "delay_ms": DEFAULT_DELAY_MS,
-                                "manual_arm": False}
+                                "manual_arm": False, "skip_imu_if_lost": False}
                          for name in CHANNEL_KEYS}}
 
 
@@ -1274,7 +1458,7 @@ def validate_config(cfg):
                                  or ch["delay_ms"] < 0):
             problems.append(f"{name}.delay_ms: must be a whole number of "
                             f"milliseconds, got {ch['delay_ms']!r}")
-        for flag in ("latch", "manual_arm"):
+        for flag in ("latch", "manual_arm", "skip_imu_if_lost"):
             if flag in ch and not isinstance(ch[flag], bool):
                 problems.append(f"{name}.{flag}: must be true or false")
 
@@ -1326,6 +1510,7 @@ def open_config_panel(parent, gs, mono, send_command, on_simulated=None):
             "latch": tk.BooleanVar(value=False),
             "delay_ms": tk.StringVar(value=str(DEFAULT_DELAY_MS)),
             "manual_arm": tk.BooleanVar(value=False),
+            "skip_imu_if_lost": tk.BooleanVar(value=False),
         }
 
     nb = ttk.Notebook(win)
@@ -1340,6 +1525,11 @@ def open_config_panel(parent, gs, mono, send_command, on_simulated=None):
         ttk.Entry(head, textvariable=vars_[name]["delay_ms"], width=8).pack(side="left", padx=4)
         ttk.Checkbutton(head, text="manual_arm",
                         variable=vars_[name]["manual_arm"]).pack(side="left", padx=(12, 0))
+        # flight_logic.c: with the IMU lost, drop FANG1/FANG2/FUTANG/BURNCOUNT
+        # from this channel's sets instead of letting them block it. A set
+        # left empty by that still never fires.
+        ttk.Checkbutton(head, text="if IMU lost: ignore tilt/burn conditions",
+                        variable=vars_[name]["skip_imu_if_lost"]).pack(side="left", padx=(12, 0))
         ttk.Label(head, text="a channel fires when its PRIMARY set is fully true, "
                              "or its SECONDARY set is", foreground="#666").pack(side="right")
 
@@ -1419,6 +1609,7 @@ def open_config_panel(parent, gs, mono, send_command, on_simulated=None):
             except ValueError:
                 ch["delay_ms"] = delay
             ch["manual_arm"] = v["manual_arm"].get()
+            ch["skip_imu_if_lost"] = v["skip_imu_if_lost"].get()
             cfg["channels"][name] = ch
         return cfg
 
@@ -1443,6 +1634,7 @@ def open_config_panel(parent, gs, mono, send_command, on_simulated=None):
             v["latch"].set(bool(ch.get("latch", False)))
             v["delay_ms"].set(str(ch.get("delay_ms", DEFAULT_DELAY_MS)))
             v["manual_arm"].set(bool(ch.get("manual_arm", False)))
+            v["skip_imu_if_lost"].set(bool(ch.get("skip_imu_if_lost", False)))
 
     def set_raw(cfg):
         raw.delete("1.0", "end")
@@ -2516,6 +2708,11 @@ def run_replay(gs, path):
     gs.capture = False
     for i in range(0, len(data), 4096):
         gs.feed(data[i:i + 4096])
+    for pkt in gs.dl_stream.flush():                 # end of file: nothing more is coming
+        gs._on_packet(pkt, time.time())
+    if not gs.transparent:
+        for pkt in gs._other_mode_stream.flush():
+            gs._on_packet(pkt, time.time())
     for line in TerminalCollapser()(gs.drain_messages()):
         print(line)
     print(gs.summary_line())
@@ -2546,21 +2743,33 @@ def run_gui(gs, port=None, baud=115200, autoclose_ms=None, on_ready=None):
     ttk.Label(top, text="Port").pack(side="left")
     port_var = tk.StringVar(value=port or "socket://127.0.0.1:9750")
     ttk.Entry(top, textvariable=port_var, width=32).pack(side="left", padx=4)
+    transparent_var = tk.BooleanVar(value=gs.transparent)
+    ttk.Checkbutton(top, text="transparent radio (AP=0)",
+                    variable=transparent_var).pack(side="left", padx=(0, 6))
     conn_btn = ttk.Button(top, text="Connect")
     conn_btn.pack(side="left")
     conn_lbl = ttk.Label(top, text="not connected")
     conn_lbl.pack(side="left", padx=10)
-    dest_txt = "broadcast" if gs.dest == BROADCAST else f"{gs.dest:016X}"
-    ttk.Label(top, text=f"uplink dest: {dest_txt}").pack(side="right")
+    dest_lbl = ttk.Label(top)
+    dest_lbl.pack(side="right")
+
+    def show_dest():
+        if gs.transparent:
+            dest_lbl.configure(text="uplink dest: ground radio's DH/DL")
+        else:
+            dest_txt = "broadcast" if gs.dest == BROADCAST else f"{gs.dest:016X}"
+            dest_lbl.configure(text=f"uplink dest: {dest_txt}")
+    show_dest()
 
     def toggle():
         if gs.connected:
             gs.disconnect()
         else:
             try:
-                gs.connect(port_var.get().strip(), baud)
+                gs.connect(port_var.get().strip(), baud, transparent=transparent_var.get())
             except Exception as e:
                 messagebox.showerror("Connect failed", str(e))
+            show_dest()
     conn_btn.configure(command=toggle)
 
     body = ttk.Frame(root, padding=(6, 0))
@@ -3039,9 +3248,13 @@ def main(argv=None):
     ap.add_argument("--no-capture", action="store_true", help="do not write raw.bin")
     ap.add_argument("--headless", action="store_true", help="terminal only, no window")
     ap.add_argument("--replay", help="decode a raw.bin capture instead of a live port")
+    ap.add_argument("--transparent", action="store_true",
+                    help="the GROUND radio is in transparent mode (AP=0); also for "
+                         "--replay of a capture taken that way")
     args = ap.parse_args(argv)
 
-    gs = GroundStation(out_dir=args.out, dest=args.dest, capture=not args.no_capture)
+    gs = GroundStation(out_dir=args.out, dest=args.dest, capture=not args.no_capture,
+                       transparent=args.transparent)
     if args.replay:
         run_replay(gs, args.replay)
         return 0

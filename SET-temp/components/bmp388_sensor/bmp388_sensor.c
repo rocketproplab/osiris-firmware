@@ -11,6 +11,7 @@
 #include "event_log.h"
 #include "flight_mode.h"
 #include "sensor_bus.h"
+#include "sensor_health.h"
 
 static const char *TAG = "BMP388";
 
@@ -42,6 +43,10 @@ struct bmp388_dev {
     bool                fast;
 
     bmp388_diag_t       diag;
+
+    /* Lost / recovered bookkeeping. Touched only by bmp388_task after
+     * init; read by bmp388_get_diagnostics() for the console. */
+    sensor_health_t     health;
 };
 
 /* ===================================================================
@@ -127,6 +132,78 @@ static void IRAM_ATTR bmp388_isr(void *arg)
 }
 
 /* ===================================================================
+ *  Is the chip still there?  (see sensor_health.h for the why)
+ * =================================================================== */
+
+static esp_err_t bmp388_configure_sensor(bmp388_handle_t dev);
+static esp_err_t bmp388_apply_rate(bmp388_handle_t dev, bool fast);
+
+/* PWR_CTRL (0x1B) bits 5:4 are the power mode; 11 = NORMAL. A chip that
+ * lost power comes back in SLEEP (00) with every setting at its default,
+ * which is the signature of a reset as opposed to a missing chip. */
+#define BMP388_PWR_MODE_MASK    0x30
+#define BMP388_PWR_MODE_NORMAL  0x30
+
+/* One question only the chip can answer correctly: its ID. Returns
+ * whether it answered; *configured (optional) says whether it is still
+ * in NORMAL mode, i.e. still running the configuration we gave it.
+ *
+ * The ID read is retried once on a mismatch. After a power-on the
+ * BMP388 is in I2C mode until it sees a falling edge on CS, and the
+ * first SPI transaction is what provides that edge -- so the first read
+ * after a reconnect is not trusted, the second one is. A chip that
+ * fails twice is not there. */
+static bool bmp388_probe(bmp388_handle_t dev, bool *configured)
+{
+    uint8_t id = 0;
+    bool    id_ok = false;
+    for (int attempt = 0; attempt < 2 && !id_ok; attempt++) {
+        int8_t r = bmp3_get_regs(BMP3_REG_CHIP_ID, &id, 1, &dev->bmp);
+        id_ok = (r == BMP3_OK) && (id == BMP3_CHIP_ID || id == BMP390_CHIP_ID);
+    }
+    if (!id_ok) {
+        return false;
+    }
+    if (configured) {
+        uint8_t pwr = 0;
+        int8_t r = bmp3_get_regs(BMP3_REG_PWR_CTRL, &pwr, 1, &dev->bmp);
+        *configured = (r == BMP3_OK) &&
+                      ((pwr & BMP388_PWR_MODE_MASK) == BMP388_PWR_MODE_NORMAL);
+    }
+    return true;
+}
+
+/* Bring a chip that just reappeared back to exactly the state the
+ * running firmware expects: soft reset and calibration reload
+ * (bmp3_init), the boot configuration with DRDY latched on INT, then
+ * the rate for the CURRENT flight mode -- a barometer that reconnects
+ * mid-flight comes back at 50 Hz, not at whatever it booted with.
+ *
+ * The cheap probe goes first so a chip that is still missing costs one
+ * ID read per retry, not a full init (bmp3_init also prints three debug
+ * lines to the console every time it runs). The ISR handler and the
+ * GPIO are untouched: they never depended on the chip. */
+static bool bmp388_recover(bmp388_handle_t dev)
+{
+    if (!bmp388_probe(dev, NULL)) {
+        return false;
+    }
+    if (bmp3_init(&dev->bmp) != BMP3_OK) {
+        return false;
+    }
+    if (bmp388_configure_sensor(dev) != ESP_OK) {
+        return false;
+    }
+    if (!flight_mode_is_fast() && bmp388_apply_rate(dev, false) != ESP_OK) {
+        return false;
+    }
+    /* Release the INT latch so the next DRDY is a fresh rising edge. */
+    uint8_t int_status = 0;
+    (void)bmp3_get_regs(BMP3_REG_INT_STATUS, &int_status, 1, &dev->bmp);
+    return true;
+}
+
+/* ===================================================================
  *  Reader task
  * =================================================================== */
 
@@ -137,10 +214,33 @@ static void bmp388_task(void *arg)
     ESP_LOGI(TAG, "reader task running on core %d", (int)xPortGetCoreID());
 
     for (;;) {
-        /* Timeout follows the CURRENT rate, re-evaluated every pass. */
-        const TickType_t timeout = pdMS_TO_TICKS(dev->fast ? BMP388_IRQ_TIMEOUT_MS
-                                                           : BMP388_IRQ_TIMEOUT_SLOW_MS);
+        /* Timeout follows the CURRENT rate, re-evaluated every pass --
+         * or, while the chip is lost, the time until the next retry. */
+        TickType_t timeout;
+        if (dev->health.lost) {
+            timeout = pdMS_TO_TICKS(sensor_health_retry_wait_ms(
+                                        &dev->health, (uint64_t)esp_timer_get_time()));
+        } else {
+            timeout = pdMS_TO_TICKS(dev->fast ? BMP388_IRQ_TIMEOUT_MS
+                                              : BMP388_IRQ_TIMEOUT_SLOW_MS);
+        }
         uint32_t notified = ulTaskNotifyTake(pdTRUE, timeout);
+        uint64_t now_us   = (uint64_t)esp_timer_get_time();
+
+        /* ---- LOST: retry on schedule, publish nothing ----------------
+         * Nothing is published while lost, on purpose. A missing chip on
+         * SPI reads back as a run of 0x00 or 0xFF that Bosch's
+         * compensation turns into a perfectly plausible pressure, and
+         * flight_logic would fly on it. No sample is better than a
+         * fabricated one: consumers see the sequence number stop. */
+        if (dev->health.lost) {
+            if (sensor_health_retry_due(&dev->health, now_us)) {
+                bool ok = bmp388_recover(dev);
+                sensor_health_retry_result(&dev->health, ok,
+                                           (uint64_t)esp_timer_get_time());
+            }
+            continue;   /* first real sample comes from the next DRDY */
+        }
 
         /* Clear the latched INT before anything else. The pin is
          * configured BMP3_INT_PIN_LATCH: after a DRDY it stays HIGH until
@@ -161,11 +261,29 @@ static void bmp388_task(void *arg)
             bmp388_set_rate(dev, want_fast);
         }
 
+        /* ---- Health: on every missed interrupt, and once a second ----
+         * A missed DRDY used to mean only "poll instead". It still does
+         * when the chip is fine and just its INT wire is quiet -- that
+         * case falls through to the polling read below, unchanged. But
+         * a missed DRDY is also the first symptom of the chip being
+         * gone or reset, so it is now the moment to ask. */
+        if (notified == 0 || sensor_health_check_due(&dev->health, now_us)) {
+            bool configured = false;
+            if (!bmp388_probe(dev, &configured)) {
+                sensor_health_lost(&dev->health, SENSOR_LOST_NO_RESPONSE, now_us);
+                continue;
+            }
+            if (!configured) {
+                sensor_health_lost(&dev->health, SENSOR_LOST_RESET, now_us);
+                continue;
+            }
+        }
+
         uint64_t stamp;
         if (notified == 0) {
             dev->diag.irq_timeouts++;
             event_log_error(ERR_SRC_BMP388, ERR_CODE_IRQ_TIMEOUT, ESP_ERR_TIMEOUT, dev->diag.irq_timeouts);
-            stamp = (uint64_t)esp_timer_get_time();
+            stamp = now_us;
         } else {
             stamp = dev->isr_timestamp_us;
         }
@@ -175,7 +293,24 @@ static void bmp388_task(void *arg)
         if (rslt != BMP3_OK) {
             dev->diag.read_errors++;
             event_log_error(ERR_SRC_BMP388, ERR_CODE_READ_FAILED, ESP_FAIL, dev->diag.read_errors);
+            /* On SPI this never happens; on an I2C build it is a NACK,
+             * which is exactly what a missing chip looks like there. */
+            if (!bmp388_probe(dev, NULL)) {
+                sensor_health_lost(&dev->health, SENSOR_LOST_BUS_ERROR, now_us);
+            }
             continue;
+        }
+
+        /* Bosch's compensation clamps pressure to 300-1250 hPa. A result
+         * sitting exactly on a clamp is what all-0x00 or all-0xFF raw
+         * bytes turn into -- the data line open while DRDY still pulses.
+         * It is also a real reading above ~9 km, so this only triggers a
+         * check; the probe decides. */
+        if (raw.pressure <= BMP3_MIN_PRES_DOUBLE || raw.pressure >= BMP3_MAX_PRES_DOUBLE) {
+            if (!bmp388_probe(dev, NULL)) {
+                sensor_health_lost(&dev->health, SENSOR_LOST_NO_RESPONSE, now_us);
+                continue;
+            }
         }
 
         bmp388_data_t sample;
@@ -394,28 +529,38 @@ esp_err_t bmp388_init(const bmp388_config_t *cfg, bmp388_handle_t *out)
     dev->bmp.write    = bmp388_bus_write;
     dev->bmp.delay_us = bmp388_delay_us;
 
+    /* A chip that does not answer at boot is NOT a reason to stop: the
+     * driver comes up anyway in the LOST state and its task keeps trying,
+     * exactly as if the chip had dropped out in flight. Returning failure
+     * here used to stop app_main before the radio started, so the ground
+     * heard nothing at all -- not even that the barometer was missing. */
+    bool present = false;
     int8_t rslt = bmp3_init(&dev->bmp);
-    if (rslt != BMP3_OK) {
+    if (rslt == BMP3_OK) {
+        ESP_LOGI(TAG, "BMP388/390 found, chip ID 0x%02X", dev->bmp.chip_id);
+        present = (bmp388_configure_sensor(dev) == ESP_OK);
+    } else {
         ESP_LOGE(TAG, "bmp3_init failed (%d) over %s -- see sensor_bus's "
                       "chip-ID line above", rslt, sensor_bus_name());
-        dev->in_use = false;
-        return ESP_FAIL;
-    }
-    ESP_LOGI(TAG, "BMP388/390 found, chip ID 0x%02X", dev->bmp.chip_id);
-
-    if (bmp388_configure_sensor(dev) != ESP_OK) {
-        dev->in_use = false;
-        return ESP_FAIL;
     }
 
     esp_err_t err = bmp388_setup_interrupt(dev);
     if (err != ESP_OK) {
         dev->in_use = false;
-        return err;
+        return err;     /* a GPIO problem: that one IS fatal */
     }
+
+    uint64_t now_us = (uint64_t)esp_timer_get_time();
+    sensor_health_init(&dev->health, ERR_SRC_BMP388, now_us);
 
     dev->initialized = true;
     *out = dev;
+    if (!present) {
+        sensor_health_lost(&dev->health, SENSOR_LOST_NO_RESPONSE, now_us);
+        ESP_LOGE(TAG, "BMP388 NOT ANSWERING -- driver started anyway, retrying "
+                      "every %d ms", SENSOR_HEALTH_RETRY_MS);
+        return ESP_ERR_NOT_FOUND;
+    }
     ESP_LOGI(TAG, "BMP388 initialized (%s, interrupt-driven)", sensor_bus_name());
     return ESP_OK;
 }
@@ -569,4 +714,12 @@ void bmp388_get_diagnostics(bmp388_handle_t dev, bmp388_diag_t *out)
         return;
     }
     *out = dev->diag;
+    /* Unlocked copy from another task: each field is one aligned word
+     * written only by bmp388_task, so a reader can see a value one
+     * update stale, never a torn one. Console figures, not control. */
+    out->lost           = dev->health.lost;
+    out->lost_count     = dev->health.lost_count;
+    out->recoveries     = dev->health.recoveries;
+    out->retry_attempts = dev->health.retry_attempts;
+    out->last_outage_ms = dev->health.last_outage_ms;
 }

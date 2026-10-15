@@ -203,32 +203,245 @@ config FC_MODE_FLIGHT
         uplink ARM/DISARM or a detected liftoff/landing.
 
 config FC_MODE_TEST
-    bool "Test (scripted STANDBY/FLIGHT cycle) -- NOT FOR FLIGHT"
+    bool "Test: Blue Raven staging/recovery signals only -- NOT FOR FLIGHT"
     help
-        Bench testing of everything that keys on the flight mode --
-        sensor rate switching, gyro power-up, telemetry rates, the
-        ground station's mode display -- without shaking the board.
+        Bench test of the two Blue Raven discrete lines and nothing else.
 
-        Boots in STANDBY, then forces, one step every FC_TEST_STEP_S
-        seconds:
+        STARTED: the staging (J8, GPIO22) and recovery (J7, GPIO23)
+        inputs, with exactly the settings under Component config ->
+        Discrete inputs (mode, resistors, thresholds); the SD card, so
+        each firing lands in event.bin as it would in flight; and a
+        console printout of both lines every FC_TEST_PRINT_MS.
 
-            STANDBY -> FLIGHT -> STANDBY -> FLIGHT -> STANDBY (stays)
+        NOT STARTED: IMU, barometer, sensor bus, XBee radio, GPS, battery
+        monitor, flight logic, status records. None of them needs to be
+        connected, and nothing is transmitted -- watch the USB console.
 
-        Every forced change is recorded in event.bin as MODE_CHANGED
-        with source TEST, so a log from a test build cannot be mistaken
-        for a flight. The flight_logic estimator is NOT told about
-        liftoff -- deployment channels stay quiet -- and the uplink and
-        IMU paths keep working as normal throughout.
+        Each line prints its voltage, its running idle average, its peak,
+        whether it is FIRED now, and how many firings were accepted.
+        Fire the Blue Raven's outputs (its own test function, or a
+        bench supply on the line) and watch them change.
 
-        The forced FLIGHT -> STANDBY step is the one thing a flight
-        build can never do. It does not exist in a FLIGHT build at all.
+        Overrides FC_ENABLE_DISCRETE_IN: the lines are always watched in
+        this mode, since watching them is the whole point.
 
 endchoice
 
-config FC_TEST_STEP_S
-    int "Seconds per step of the test sequence"
+config FC_TEST_PRINT_MS
+    int "Console printout period in the Blue Raven test (ms)"
     depends on FC_MODE_TEST
-    range 1 600
-    default 5
+    range 100 10000
+    default 500
+    help
+        How often both lines' readings are printed. Firings are logged
+        the instant they are detected regardless of this.
+
+endmenu
+
+menu "Flight Computer Power Saving"
+
+# =====================================================================
+#  Standby current. The board was measured at ~120 mA on the 3V3 rail
+#  in STANDBY and ~200 mA in flight (2026-10-04). Everything in this
+#  menu changes what the board draws on the pad and nothing about how
+#  it behaves once ARMED: every option here either never touches a
+#  flight path, or is explicitly undone the moment the mode goes fast.
+# =====================================================================
+
+config FC_PHY_HOLD_RESET
+    bool "Hold the module's Ethernet PHY in reset"
+    default y
+    help
+        The ESP32-P4-ETH carries an IP101 Ethernet PHY that this firmware
+        never uses. Out of reset it powers its analog front end and keeps
+        sending link pulses to a cable that is not there, with no code
+        asking it to. Driving its RST_N low at the top of app_main stops
+        that for the life of the boot.
+
+        Turn this off only if a build ever needs Ethernet.
+
+config FC_PHY_RESET_GPIO
+    int "PHY reset GPIO (IP101 RST_N, active low)"
+    depends on FC_PHY_HOLD_RESET
+    range 0 54
+    default 51
+    help
+        GPIO51 on the Waveshare ESP32-P4-ETH. Internal to the module --
+        not on the J1 header, so it collides with nothing on PCB v1.
+
+config FC_GPS_OFF_IN_STANDBY
+    bool "Power the GPS down in STANDBY"
+    default y
+    help
+        Drives the PA1616D's EN (GPIO33) low while the vehicle is in
+        STANDBY and high in ARMED, FLIGHT and LANDED. Saves roughly the
+        module's tracking current (~20 mA on the 3V3 rail).
+
+        Cost: fix delay after ARM. With the breakout's CR1220 coin cell
+        fitted the module keeps time and satellite data and is back in
+        seconds; without it, every ARM is a cold start of 30 s or more.
+        An IMU-triggered launch from STANDBY flies its first seconds with
+        no fix. STATUS_FLAG_GPS_FIX reads clear while the module is off.
+
+config FC_PM_DFS
+    bool "Scale the CPU clock down in STANDBY"
+    depends on PM_ENABLE
+    default y
+    help
+        ESP-IDF dynamic frequency scaling: when nothing holds a power-
+        management lock the CPU drops to FC_PM_MIN_FREQ_MHZ, and drivers
+        raise it on their own for the duration of each transaction.
+
+        Outside STANDBY the firmware holds an ESP_PM_CPU_FREQ_MAX lock,
+        so ARMED, FLIGHT and LANDED run at full clock exactly as before.
+        The lock is taken from inside the mode transition itself, so an
+        IMU liftoff out of STANDBY is at full clock in the same instant.
+
+        Requires Component config -> Power Management -> Support for
+        power management (CONFIG_PM_ENABLE).
+
+config FC_PM_MIN_FREQ_MHZ
+    int "Minimum CPU frequency in STANDBY (MHz)"
+    depends on FC_PM_DFS
+    default 40
+    help
+        40 is the crystal frequency, the lowest DFS will go. Standby
+        work is a 12.5 Hz IMU read, a 1.5 Hz baro read and a 1 Hz status
+        record -- microseconds each even at 40 MHz.
+
+endmenu
+
+menu "Flight Computer Battery Sense"
+
+# =====================================================================
+#  How the pack voltage on GPIO20 (ADC1_CH4) is turned back into a
+#  battery voltage:
+#
+#      battery_v = adc_v * (R_top + R_bottom) / R_bottom * gain + offset
+#
+#  The resistor values set the divider; gain and offset trim what is
+#  left after it, measured against a multimeter. Kconfig has no float
+#  type, so everything here is an integer in ohms, millivolts or parts
+#  per million. adc_v is logged untrimmed in batt.bin, so a calibration
+#  done later can still be applied to an old log.
+# =====================================================================
+
+config FC_VBAT_R_TOP_OHMS
+    int "Divider top resistor: battery+ to the sense node (ohms)"
+    range 1 10000000
+    default 6800
+    help
+        The resistor from BT1+ to the divider node (R1 on PCB v1).
+
+        Watch the ratio: the pin must stay below ~3.1 V at full charge.
+        For a 2S pack (8.4 V) that needs R_bottom / (R_top + R_bottom)
+        below ~0.37. 6.8k / 3k is 0.306: 2.57 V on the pin at 8.4 V,
+        and readable up to ~10.1 V. Two equal resistors (0.5) would put
+        4.2 V on the pin, clipping the ADC and exceeding the chip's
+        3.3 V supply. The boot log says so in red if the ratio is too
+        large for FC_VBAT_PACK_MAX_MV.
+
+        The divider draws pack / (R_top + R_bottom) continuously:
+        ~0.76 mA for 6.8k + 3k on 7.4 V.
+
+config FC_VBAT_R_BOTTOM_OHMS
+    int "Divider bottom resistor: sense node to ground (ohms)"
+    range 1 10000000
+    default 3000
+    help
+        The resistor from the divider node to GND (R2 on PCB v1; the
+        board's original design value was 2.7k, the fitted part is 3k). The series resistor into the pin (R3)
+        carries no steady current and does not enter the ratio.
+
+config FC_VBAT_GAIN_PPM
+    int "Calibration gain (parts per million, 1000000 = x1.0)"
+    range 500000 1500000
+    default 1000000
+    help
+        Multiplies the reconstructed pack voltage. Corrects resistor
+        tolerance and ADC gain error together.
+
+        One-point calibration, offset left at 0:
+          1. Measure the pack with a multimeter at the battery terminals.
+          2. Read battery_v from the ground station or the console.
+          3. Set this to 1000000 * meter / reported.
+        Example: meter 7.92 V, firmware says 7.80 V -> 1015385.
+
+        For two points (a full and a part-discharged pack), solve
+        meter = reported * gain + offset for both.
+
+config FC_VBAT_OFFSET_MV
+    int "Calibration offset (mV, added after the gain)"
+    range -2000 2000
+    default 0
+    help
+        Added to the pack voltage after the gain. Leave at 0 unless a
+        two-point calibration says otherwise.
+
+config FC_VBAT_PACK_MAX_MV
+    int "Highest pack voltage to expect (mV)"
+    range 1000 30000
+    default 8400
+    help
+        Full-charge voltage of the pack: 8400 for 2S LiPo, 12600 for 3S.
+        Used only by a boot-time check that the divider above keeps the
+        ADC pin inside its range at this voltage. It changes no reading.
+
+endmenu
+
+menu "Flight Computer Sensor Failover"
+
+# =====================================================================
+#  What flight_logic does when a sensor stops producing samples.
+#  "Stops" is judged from the sample sequence number, so it covers an
+#  unplugged chip, a reset one and a dead task alike. See flight_logic.h.
+#
+#    IMU silent      -> logic keeps running on altitude; tilt invalid for
+#                       the rest of the flight if after liftoff; liftoff
+#                       from altitude if before
+#    barometer silent -> altitude, velocity and apogee from GPS
+#    both             -> GPS altitude, IMU rules as above
+# =====================================================================
+
+config FC_FAILOVER_MS
+    int "Sensor silent this long before switching to the backup (ms)"
+    range 200 30000
+    default 2000
+    help
+        How long the IMU or the barometer may produce no new sample
+        before flight_logic stops waiting for it and uses the backup.
+
+        Short on purpose. Apogee comes roughly 15-20 s after liftoff, and
+        every millisecond of this is time the logic spends with stale
+        altitude. Transient glitches are already absorbed below this
+        level: a sensor driver only stops publishing after a failed ID
+        check, and retries every 250 ms.
+
+        In STANDBY the effective value is at least 5000 ms, because the
+        barometer samples at 1.5 Hz there and would otherwise flap.
+
+config FC_ALT_LIFTOFF_AGL_M
+    int "Liftoff from altitude, when the IMU is lost (m above the pad)"
+    range 5 500
+    default 30
+    help
+        With the IMU silent, the accelerometer cannot detect liftoff, and
+        nothing is evaluated before liftoff. Instead, liftoff is declared
+        when altitude (barometer, or GPS if that is the live source) is
+        above this for 3 consecutive barometer samples or 2 GPS fixes.
+
+        It is late by however long the climb takes -- typically a
+        second or two -- and TVAL timings shift by that much. It also
+        moves the flight mode to FLIGHT, since with no IMU there is no
+        wake-up interrupt to do it. Active only while the IMU is silent.
+
+config FC_GPS_STALE_MS
+    int "GPS fix older than this is not used for altitude (ms)"
+    range 1500 30000
+    default 3000
+    help
+        The GPS updates once a second. A fix older than this is treated
+        as no fix, and with the barometer also silent the altitude
+        source becomes NONE: every AGL/VEL/BVEL/PINC event reads false.
 
 endmenu

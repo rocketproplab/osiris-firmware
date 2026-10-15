@@ -6,6 +6,10 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_pm.h"
+#include "driver/gpio.h"
+#include "freertos/semphr.h"
+#include "sdkconfig.h"
 
 
 #include "sensor_bus.h"
@@ -22,6 +26,7 @@
 #include "event_log.h"
 #include "flight_mode.h"
 #include "battery_monitor.h"
+#include "sensor_health.h"
 
 /* ===================================================================
  *  Task priorities
@@ -170,8 +175,8 @@ static const char *TAG = "main";
  * pull-up from 3V3 onto PIN_TX_XBEE, which holds the XBee's DIN at the
  * UART idle level while the ESP32 pin is still high-Z during boot. */
 #define XBEE_UART_PORT    2              /* UART_NUM_2 */
-#define PIN_TX_XBEE       3              /* J1.14 -> J5.4 DIN  */
-#define PIN_RX_XBEE       4              /* J1.12 -> J5.3 DOUT */
+#define PIN_TX_XBEE       4              /* J1.14 -> J5.4 DIN  */
+#define PIN_RX_XBEE       3              /* J1.12 -> J5.3 DOUT */
 #define PIN_RST_XBEE      GPIO_NUM_2     /* J1.15 -> J5.6 RST  */
 #define PIN_CTS_XBEE      GPIO_NUM_5     /* J1.11 -> J5.14 CTS */
 #define XBEE_BAUD_RATE    115200         /* must match the module's ATBD */
@@ -188,11 +193,25 @@ static const char *TAG = "main";
 #define PIN_STAGING_IN    GPIO_NUM_22    /* J1.32 <- J8.2, Blue Raven staging  */
 #define PIN_RECOVERY_IN   GPIO_NUM_23    /* J1.31 <- J7.2, Blue Raven recovery */
 
-/* Battery sense: BT1+ through 6.8k/2.7k (R1/R2) = x 0.284, then 1k
- * (R3) into the pin with 100nF (C2) to ground. GPIO20 is ADC1_CH4.
- * 3.3 V full scale corresponds to 11.6 V at the battery. */
+/* Battery sense: BT1+ through the R1/R2 divider, then 1k (R3) into the
+ * pin with 100nF (C2) to ground. GPIO20 is ADC1_CH4. Resistor values
+ * and the calibration trim come from menuconfig -> "Flight Computer
+ * Battery Sense"; the fallbacks below only apply to builds whose
+ * sdkconfig predates those options (and to the host compile check), and
+ * match the Kconfig defaults so both read the same. */
+#ifndef CONFIG_FC_VBAT_R_TOP_OHMS
+#define CONFIG_FC_VBAT_R_TOP_OHMS     6800
+#define CONFIG_FC_VBAT_R_BOTTOM_OHMS  3000
+#define CONFIG_FC_VBAT_GAIN_PPM       1000000
+#define CONFIG_FC_VBAT_OFFSET_MV      0
+#define CONFIG_FC_VBAT_PACK_MAX_MV    8400
+#endif
 #define PIN_VBAT_SENSE    GPIO_NUM_20    /* J1.35, ADC1_CH4 */
-#define VBAT_DIVIDER_RATIO  0.2842f      /* 2.7 / (6.8 + 2.7) */
+#define VBAT_DIVIDER_RATIO  ((float)CONFIG_FC_VBAT_R_BOTTOM_OHMS / \
+                             (float)(CONFIG_FC_VBAT_R_TOP_OHMS + CONFIG_FC_VBAT_R_BOTTOM_OHMS))
+#define VBAT_GAIN           ((float)CONFIG_FC_VBAT_GAIN_PPM / 1000000.0f)
+#define VBAT_OFFSET_VOLTS   ((float)CONFIG_FC_VBAT_OFFSET_MV / 1000.0f)
+#define VBAT_PACK_MAX_VOLTS ((float)CONFIG_FC_VBAT_PACK_MAX_MV / 1000.0f)
 #define VBAT_ADC_CHANNEL    ADC_CHANNEL_4 /* GPIO20 on ADC1 -- fixed by silicon */
 #define VBAT_SAMPLE_RATE_HZ 10
 
@@ -271,43 +290,6 @@ static StackType_t  s_print_stack[PRINT_TASK_STACK_WORDS];
 static StaticTask_t s_status_tcb;
 static StackType_t  s_status_stack[STATUS_TASK_STACK_WORDS];
 
-#ifdef CONFIG_FC_MODE_TEST
-/* ===================================================================
- *  TEST build: scripted mode sequence (menuconfig -> Flight Computer
- *  Operating Mode). One step every CONFIG_FC_TEST_STEP_S seconds,
- *  counted from when this task starts, i.e. once everything else is up:
- *
- *      STANDBY -> FLIGHT -> STANDBY -> FLIGHT -> STANDBY (and stays)
- *
- *  Uses flight_mode_test_force(), the only path out of FLIGHT, and it
- *  exists only in this build. The task deletes itself when done.
- * =================================================================== */
-#define TEST_SEQ_STACK_WORDS  2048
-static StaticTask_t s_test_seq_tcb;
-static StackType_t  s_test_seq_stack[TEST_SEQ_STACK_WORDS];
-
-static void test_sequence_task(void *arg)
-{
-    (void)arg;
-    static const flight_mode_t steps[] = {
-        MODE_FLIGHT, MODE_STANDBY, MODE_FLIGHT, MODE_STANDBY,
-    };
-    const int n = (int)(sizeof(steps) / sizeof(steps[0]));
-    const TickType_t step = pdMS_TO_TICKS(CONFIG_FC_TEST_STEP_S * 1000);
-
-    /* DelayUntil, not Delay: the steps stay exactly step apart however
-     * long the logging inside the loop takes. */
-    TickType_t last = xTaskGetTickCount();
-    for (int i = 0; i < n; i++) {
-        vTaskDelayUntil(&last, step);
-        ESP_LOGW(TAG, "TEST step %d/%d -> %s", i + 1, n, flight_mode_name(steps[i]));
-        flight_mode_test_force(steps[i]);
-    }
-    ESP_LOGW(TAG, "TEST sequence complete -- staying in STANDBY");
-    vTaskDelete(NULL);
-}
-#endif /* CONFIG_FC_MODE_TEST */
-
 /* ===================================================================
  *  BMP388 bring-up
  * =================================================================== */
@@ -339,9 +321,13 @@ static esp_err_t baro_start(bmp388_handle_t *out)
 
     bmp388_handle_t baro = NULL;
     esp_err_t err = bmp388_init(&cfg, &baro);
-    if (err != ESP_OK) {
+    /* ESP_ERR_NOT_FOUND: the chip did not answer, but the driver is up in
+     * the LOST state and its task keeps trying. Start it like any other
+     * and hand the code back so app_main can say so. */
+    if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
         return err;
     }
+    esp_err_t present = err;
 
     /* Priority 10, pinned to core 0. Pinning matters: an unpinned task can
      * migrate between cores, and you want the sensor task's timing
@@ -353,7 +339,7 @@ static esp_err_t baro_start(bmp388_handle_t *out)
     }
 
     *out = baro;
-    return ESP_OK;
+    return present;   /* ESP_OK, or ESP_ERR_NOT_FOUND: running but LOST */
 }
 
 /* ===================================================================
@@ -378,9 +364,13 @@ static esp_err_t imu_start(lsm6dsox_handle_t *out)
 
     lsm6dsox_handle_t imu = NULL;
     esp_err_t err = lsm6dsox_init(&cfg, &imu);
-    if (err != ESP_OK) {
+    /* ESP_ERR_NOT_FOUND: the chip did not answer, but the driver is up in
+     * the LOST state and its task keeps trying. Start it like any other
+     * and hand the code back so app_main can say so. */
+    if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
         return err;
     }
+    esp_err_t present = err;
 
     /* Same priority tier as the barometer, also pinned to core 0 -- both
      * sensor tasks are short interrupt-driven reads, not compute-heavy,
@@ -394,7 +384,7 @@ static esp_err_t imu_start(lsm6dsox_handle_t *out)
     }
 
     *out = imu;
-    return ESP_OK;
+    return present;   /* ESP_OK, or ESP_ERR_NOT_FOUND: running but LOST */
 }
 
 /* ===================================================================
@@ -628,20 +618,66 @@ static void flight_logic_task(void *arg)
             ESP_LOGW(TAG, "deployment config re-loaded from NVS and applied");
         }
 
-        lsm6_data_t imu;
-        if (lsm6dsox_wait_for_sample(h->imu, last, &imu, pdMS_TO_TICKS(200)) != ESP_OK) {
-            continue;
+        /* ---------------------------------------------------------------
+         *  Paced by the IMU -- until the IMU goes quiet.
+         *
+         *  The wait times out after 20 ms in flight (an IMU sample is
+         *  due every ~10 ms) and 200 ms in STANDBY (every 80 ms), so it
+         *  only expires when samples have actually stopped. When it
+         *  does, the tick still runs, handing over the last IMU sample
+         *  again: flight_logic sees its sequence number has not moved
+         *  and runs only the barometer and GPS parts. That is what keeps
+         *  apogee and the recovery channels alive with the IMU
+         *  unplugged -- before this, a missing IMU stopped the whole
+         *  loop, barometer included. 20 ms is fast enough not to miss a
+         *  50 Hz barometer sample.
+         * --------------------------------------------------------------- */
+        TickType_t wait = pdMS_TO_TICKS(flight_mode_is_fast() ? 20 : 200);
+        lsm6_data_t imu = {0};
+        bool imu_new = false;
+        if (h->imu) {
+            imu_new = (lsm6dsox_wait_for_sample(h->imu, last, &imu, wait) == ESP_OK);
+            if (imu_new) {
+                last = imu.seq;
+            } else {
+                lsm6dsox_get_latest(h->imu, &imu);   /* stale: seq unchanged */
+            }
+        } else {
+            /* No IMU driver at all: wait_for_sample(NULL) returns at once,
+             * which would spin this priority-7 task and starve the radio
+             * and the SD writer beneath it. Pace on the clock instead. */
+            vTaskDelay(wait);
         }
-        last = imu.seq;
 
         /* Latest available, possibly the same one as last tick. The
          * estimator detects that by sequence number, not by comparing
          * altitudes -- two genuinely identical readings are ordinary. */
-        bmp388_data_t baro;
+        bmp388_data_t baro = {0};
         bmp388_get_latest(h->baro, &baro);
 
-        uint32_t now_ms = (uint32_t)(imu.timestamp_us / 1000ULL);
-        deploy_logic_update(&s_deploy_cfg, &baro, &imu, now_ms);
+        /* GPS altitude, the last-resort altitude source. Only offered
+         * while the module is powered: gps_get_latest() keeps returning
+         * the last fix forever, and with the GPS off in STANDBY that
+         * would be an hours-old altitude. */
+        deploy_gps_t gps_in = {0};
+        const deploy_gps_t *gps_ptr = NULL;
+        if (h->gps && gps_is_enabled(h->gps)) {
+            gps_data_t g;
+            if (gps_get_latest(h->gps, &g) == ESP_OK) {
+                gps_in.seq         = g.seq;
+                gps_in.altitude_m  = g.altitude_m;
+                gps_in.fix_quality = g.fix_quality;
+                gps_ptr = &gps_in;
+            }
+        }
+
+        /* The IMU's own timestamp on a real sample, as before (tilt
+         * integrates on it); the wall clock on a tick where it is
+         * silent. Both are esp_timer microseconds. */
+        uint32_t now_ms = imu_new ? (uint32_t)(imu.timestamp_us / 1000ULL)
+                                  : (uint32_t)((uint64_t)esp_timer_get_time() / 1000ULL);
+        deploy_inputs_t in = { .baro = &baro, .imu = &imu, .gps = gps_ptr };
+        deploy_logic_update_ex(&s_deploy_cfg, &in, now_ms);
     }
 }
 
@@ -840,6 +876,9 @@ static esp_err_t battery_start_monitor(battery_handle_t *out)
         .oversample     = BATTERY_OVERSAMPLE,
         .warn_volts     = VBAT_WARN_VOLTS,
         .critical_volts = VBAT_CRITICAL_VOLTS,
+        .gain           = VBAT_GAIN,
+        .offset_v       = VBAT_OFFSET_VOLTS,
+        .max_pack_volts = VBAT_PACK_MAX_VOLTS,
     };
 
     battery_handle_t batt = NULL;
@@ -935,6 +974,161 @@ static void status_eject_sd(sensor_handles_t *h, uint32_t cause)
     }
 }
 
+/* ===================================================================
+ *  Power saving -- see "Flight Computer Power Saving" in menuconfig.
+ *
+ *  Measured 2026-10-04 on the 3V3 rail: ~120 mA in STANDBY, ~200 mA in
+ *  flight. The mode machine only ever slowed the sensors and the
+ *  downlink, which are not where that 120 mA goes. Three loads never
+ *  heard about STANDBY at all: the Ethernet PHY nobody uses, a CPU
+ *  idling at 360 MHz, and a GPS tracking satellites on the pad. This
+ *  section is those three.
+ *
+ *  THE RULE: nothing here changes how the vehicle behaves once ARMED.
+ *  The PHY is unused in every mode. The clock is locked to full speed
+ *  whenever flight_mode_is_fast(). The GPS is on whenever
+ *  flight_mode_is_fast().
+ * =================================================================== */
+
+/* Earliest thing in app_main: every millisecond before this the PHY is
+ * running on whatever Waveshare's pull resistor says. Level is set
+ * BEFORE the pad becomes an output, so the pin goes straight from
+ * high-Z to low and never drives a high on the way. */
+static void power_phy_hold_reset(void)
+{
+#ifdef CONFIG_FC_PHY_HOLD_RESET
+    const gpio_num_t pin = (gpio_num_t)CONFIG_FC_PHY_RESET_GPIO;
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << pin,
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    esp_err_t err = gpio_set_level(pin, 0);
+    if (err == ESP_OK) {
+        err = gpio_config(&io);
+    }
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Ethernet PHY held in reset (GPIO%d low)", (int)pin);
+    } else {
+        /* Not fatal: the PHY just keeps drawing, as it always has. */
+        ESP_LOGW(TAG, "could not hold the Ethernet PHY in reset: %s",
+                 esp_err_to_name(err));
+    }
+#endif
+}
+
+#ifdef CONFIG_FC_PM_DFS
+static esp_pm_lock_handle_t s_pm_fast_lock;     /* NULL = DFS not running */
+static bool                 s_pm_fast_held;
+static SemaphoreHandle_t    s_pm_mutex;
+static StaticSemaphore_t    s_pm_mutex_buf;
+#endif
+
+/* Makes the clock lock agree with the CURRENT mode, not with whatever
+ * transition triggered the call. Two transitions racing from two tasks
+ * (an uplink DISARM and an IMU liftoff, say) therefore cannot leave the
+ * lock out of step: whichever caller runs last looks at the mode that
+ * actually won. Also run once a second from status_task, so a missed
+ * call is corrected within a tick -- belt and braces, not the mechanism.
+ *
+ * A mutex rather than a critical section: esp_pm_lock_acquire() can
+ * switch the CPU frequency, and that is not something to do with
+ * interrupts masked. Every caller is a task. */
+static void power_reconcile_clock(void)
+{
+#ifdef CONFIG_FC_PM_DFS
+    if (!s_pm_fast_lock) {
+        return;
+    }
+    xSemaphoreTake(s_pm_mutex, portMAX_DELAY);
+    bool want = flight_mode_is_fast();
+    if (want && !s_pm_fast_held) {
+        if (esp_pm_lock_acquire(s_pm_fast_lock) == ESP_OK) {
+            s_pm_fast_held = true;
+        }
+    } else if (!want && s_pm_fast_held) {
+        if (esp_pm_lock_release(s_pm_fast_lock) == ESP_OK) {
+            s_pm_fast_held = false;
+        }
+    }
+    xSemaphoreGive(s_pm_mutex);
+#endif
+}
+
+/* flight_mode's listener: runs inside the transition, on the task that
+ * caused it. For an IMU liftoff out of STANDBY that is lsm6dsox_task,
+ * which is the whole reason this is a callback and not a poll -- the
+ * vehicle is at full clock before that task reads its next sample. */
+static void power_on_mode_change(flight_mode_t from, flight_mode_t to)
+{
+    (void)from;
+    (void)to;
+    power_reconcile_clock();
+}
+
+/* Call after flight_mode_init() and before any task that can change the
+ * mode. If anything here fails the board simply runs at full clock all
+ * the time, which is exactly what it did before this existed. */
+static void power_pm_init(void)
+{
+#ifdef CONFIG_FC_PM_DFS
+    s_pm_mutex = xSemaphoreCreateMutexStatic(&s_pm_mutex_buf);
+
+    esp_err_t err = esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "fc_fast",
+                                       &s_pm_fast_lock);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "DFS off: lock create failed: %s", esp_err_to_name(err));
+        s_pm_fast_lock = NULL;
+        return;
+    }
+
+    esp_pm_config_t pm = {
+        .max_freq_mhz       = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+        .min_freq_mhz       = CONFIG_FC_PM_MIN_FREQ_MHZ,
+        .light_sleep_enable = false,   /* see the power notes in the docs:
+                                        * needs wake sources first */
+    };
+    err = esp_pm_configure(&pm);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "DFS off: esp_pm_configure failed: %s", esp_err_to_name(err));
+        esp_pm_lock_delete(s_pm_fast_lock);
+        s_pm_fast_lock = NULL;
+        return;
+    }
+
+    power_reconcile_clock();                 /* boot is STANDBY: takes nothing */
+    flight_mode_set_listener(power_on_mode_change);
+    ESP_LOGI(TAG, "DFS on: %d-%d MHz in STANDBY, locked to %d MHz when fast",
+             CONFIG_FC_PM_MIN_FREQ_MHZ, CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+             CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ);
+#endif
+}
+
+/* GPS on whenever the vehicle is fast, off in STANDBY. Polled from
+ * status_task rather than run inside the transition: a fix takes
+ * seconds regardless, so a second of polling latency costs nothing,
+ * and it keeps a UART pin reconfiguration out of the liftoff path. */
+static void power_apply_gps(sensor_handles_t *h)
+{
+#ifdef CONFIG_FC_GPS_OFF_IN_STANDBY
+    if (!h->gps) {
+        return;
+    }
+    bool want = flight_mode_is_fast();
+    if (gps_is_enabled(h->gps) != want) {
+        esp_err_t err = gps_set_enabled(h->gps, want);
+        if (err != ESP_OK && err != ESP_ERR_NOT_SUPPORTED) {
+            ESP_LOGW(TAG, "GPS %s failed: %s", want ? "enable" : "disable",
+                     esp_err_to_name(err));
+        }
+    }
+#else
+    (void)h;
+#endif
+}
+
 static void status_task(void *arg)
 {
     sensor_handles_t *h = (sensor_handles_t *)arg;
@@ -946,7 +1140,15 @@ static void status_task(void *arg)
 
     ESP_LOGI(TAG, "status task running on core %d", (int)xPortGetCoreID());
 
+#ifdef CONFIG_FC_PM_DFS
+    bool pm_locks_dumped = false;
+#endif
+    uint32_t next_null_announce_s = 0;
+
     for (;;) {
+        power_apply_gps(h);
+        power_reconcile_clock();
+
         /* Performed before this tick's record is built, so the very
          * next status the ground receives is already reporting
          * STATUS_FLAG_SD_OK clear. telemetry sets the ping request
@@ -1001,6 +1203,29 @@ static void status_task(void *arg)
                          flight_mode_name(m));
             }
         }
+#ifdef CONFIG_FC_PM_DFS
+        /* Once, 30 s in: which power-management locks exist and who is
+         * holding them. If anything holds an APB or CPU max lock for
+         * good in STANDBY, DFS is saving nothing, and this is where
+         * that shows up. */
+        if (!pm_locks_dumped && uptime_s >= 30) {
+            pm_locks_dumped = true;
+            ESP_LOGI(TAG, "power-management locks at 30 s (STANDBY should hold none):");
+            esp_pm_dump_locks(stdout);
+        }
+#endif
+        /* A sensor whose DRIVER could not start has a NULL handle and no
+         * task to report on its behalf. Say so here, every 5 s, the same
+         * cadence a running driver re-announces a lost chip on -- the
+         * first time this runs is the first moment the radio exists. */
+        if (uptime_s >= next_null_announce_s) {
+            next_null_announce_s = uptime_s + SENSOR_HEALTH_REANNOUNCE_MS / 1000;
+            if (!h->baro)    { event_log_event(EV_SENSOR_LOST, ERR_SRC_BMP388,   SENSOR_LOST_NO_RESPONSE); }
+            if (!h->imu)     { event_log_event(EV_SENSOR_LOST, ERR_SRC_LSM6DSOX, SENSOR_LOST_NO_RESPONSE); }
+            if (!h->gps)     { event_log_event(EV_SENSOR_LOST, ERR_SRC_GPS,      SENSOR_LOST_NO_RESPONSE); }
+            if (!h->battery) { event_log_event(EV_SENSOR_LOST, ERR_SRC_BATTERY,  SENSOR_LOST_NO_RESPONSE); }
+        }
+
         bool pinged = h->telemetry && telemetry_take_ping_request(h->telemetry);
 
         status_record_t rec = {0};
@@ -1040,7 +1265,12 @@ static void status_task(void *arg)
         }
         if (h->gps) {
             gps_data_t g;
-            if (gps_get_latest(h->gps, &g) == ESP_OK && g.fix_quality > 0) {
+            /* gps_get_latest() keeps returning the last fix forever, so
+             * with the module powered down in STANDBY this would report
+             * a fix from whenever it was last on. Clear means "no fix
+             * right now", which is what the ground station reads it as. */
+            if (gps_is_enabled(h->gps) &&
+                gps_get_latest(h->gps, &g) == ESP_OK && g.fix_quality > 0) {
                 flags |= STATUS_FLAG_GPS_FIX;
             }
         }
@@ -1078,8 +1308,133 @@ static void status_task(void *arg)
  *  Entry point
  * =================================================================== */
 
+#if defined(CONFIG_FC_ENABLE_DISCRETE_IN) || defined(CONFIG_FC_MODE_TEST)
+/* The two Blue Raven lines. File scope so the normal boot and the TEST
+ * build use exactly the same table.
+ *
+ * Thresholds are used only in analog mode (menuconfig: Discrete
+ * inputs). The fallbacks match the Kconfig defaults and exist so a
+ * digital build, which has no such options, still compiles. */
+#ifndef CONFIG_DISCRETE_IN_STAGING_FIRE_MV
+#define CONFIG_DISCRETE_IN_STAGING_FIRE_MV      3000
+#define CONFIG_DISCRETE_IN_STAGING_RELEASE_MV   2950
+#define CONFIG_DISCRETE_IN_RECOVERY_FIRE_MV     3000
+#define CONFIG_DISCRETE_IN_RECOVERY_RELEASE_MV  2950
+#endif
+static const discrete_in_config_t discrete_cfgs[2] = {
+    { .input_pin = PIN_STAGING_IN,  .output_pin = PIN_STAGING_OUT,
+      .event = EV_STAGING_SIGNAL,  .channel = 0, .name = "staging",
+      .source = "Blue Raven staging out (tapped from the actuation branch)",
+      .fire_mv    = CONFIG_DISCRETE_IN_STAGING_FIRE_MV,
+      .release_mv = CONFIG_DISCRETE_IN_STAGING_RELEASE_MV },
+    { .input_pin = PIN_RECOVERY_IN, .output_pin = GPIO_NUM_NC,
+      .event = EV_RECOVERY_SIGNAL, .channel = 1, .name = "recovery",
+      .source = "Blue Raven recovery out (tapped from the actuation branch)",
+      .fire_mv    = CONFIG_DISCRETE_IN_RECOVERY_FIRE_MV,
+      .release_mv = CONFIG_DISCRETE_IN_RECOVERY_RELEASE_MV },
+};
+#endif
+
+#ifdef CONFIG_FC_MODE_TEST
+/* ===================================================================
+ *  TEST build: Blue Raven staging / recovery lines ONLY.
+ *  (menuconfig -> Flight Computer Operating Mode)
+ *
+ *  Brings up the two discrete inputs and the SD card and nothing else:
+ *  no sensor bus, IMU, barometer, GPS, XBee, battery monitor or flight
+ *  logic. Each accepted firing is logged by discrete_in itself the
+ *  moment it happens and written to event.bin; this task only prints
+ *  a periodic snapshot of both lines to the USB console.
+ * =================================================================== */
+#define BENCH_STACK_WORDS  3072
+static StaticTask_t s_bench_tcb;
+static StackType_t  s_bench_stack[BENCH_STACK_WORDS];
+
+static void bench_monitor_task(void *arg)
+{
+    sensor_handles_t *h = (sensor_handles_t *)arg;
+    const TickType_t period = pdMS_TO_TICKS(CONFIG_FC_TEST_PRINT_MS);
+    TickType_t last = xTaskGetTickCount();
+
+    for (;;) {
+        vTaskDelayUntil(&last, period);
+        for (int i = 0; i < 2; i++) {
+            if (!h->discrete[i]) {
+                ESP_LOGE(TAG, "[%-8s] NOT RUNNING (init failed, see above)",
+                         discrete_cfgs[i].name);
+                continue;
+            }
+            discrete_in_diag_t d;
+            discrete_in_get_diagnostics(h->discrete[i], &d);
+#ifdef CONFIG_DISCRETE_IN_MODE_ANALOG
+            ESP_LOGI(TAG, "[%-8s] %-5s %4lu mV  (fire >= %lu, release <= %lu)  "
+                          "idle avg %4lu  peak %4lu  fired %lu  suppressed %lu%s",
+                     discrete_cfgs[i].name, d.high ? "FIRED" : "idle",
+                     (unsigned long)d.last_mv,
+                     (unsigned long)discrete_cfgs[i].fire_mv,
+                     (unsigned long)discrete_cfgs[i].release_mv,
+                     (unsigned long)d.idle_mv, (unsigned long)d.peak_mv,
+                     (unsigned long)d.triggers, (unsigned long)d.suppressed,
+                     d.clipped ? "  ADC CLIPPED" : "");
+#else
+            ESP_LOGI(TAG, "[%-8s] digital  fired %lu  suppressed %lu  (%s)",
+                     discrete_cfgs[i].name, (unsigned long)d.triggers,
+                     (unsigned long)d.suppressed,
+                     gpio_get_level(discrete_cfgs[i].input_pin) ? "pin HIGH" : "pin LOW");
+#endif
+        }
+    }
+}
+
+static void blue_raven_bench_test(void)
+{
+    ESP_LOGE(TAG, "=====================================================");
+    ESP_LOGE(TAG, "  TEST BUILD -- NOT FOR FLIGHT");
+    ESP_LOGE(TAG, "  Blue Raven staging / recovery lines ONLY.");
+    ESP_LOGE(TAG, "  IMU, barometer, GPS, XBee, battery: NOT started.");
+    ESP_LOGE(TAG, "  menuconfig -> Flight Computer Operating Mode");
+    ESP_LOGE(TAG, "=====================================================");
+
+    /* SD first, so the firings land in event.bin exactly as in flight.
+     * Optional: without a card the console still shows everything. */
+    if (sd_start(&s_sensors.sd) != ESP_OK) {
+        ESP_LOGW(TAG, "no SD card -- firings go to the console only");
+        s_sensors.sd = NULL;
+    }
+    data_router_init(s_sensors.sd, NULL);   /* NULL: no radio */
+    event_log_init(data_router_publish);
+    event_log_event(EV_BOOT, 0, 0);
+    if (s_sensors.sd) {
+        event_log_event(EV_SD_MOUNTED, 0, 0);
+    }
+
+    for (int i = 0; i < 2; i++) {
+        esp_err_t err = discrete_in_init(&discrete_cfgs[i], &s_sensors.discrete[i]);
+        if (err == ESP_OK) {
+            err = discrete_in_start(s_sensors.discrete[i], PRIO_DISCRETE, 0);
+        }
+        if (err != ESP_OK) {
+            /* Unlike flight, keep going: the other line is still worth testing. */
+            ESP_LOGE(TAG, "%s line failed to start: %s", discrete_cfgs[i].name,
+                     esp_err_to_name(err));
+            s_sensors.discrete[i] = NULL;
+        }
+    }
+
+    if (!xTaskCreateStaticPinnedToCore(bench_monitor_task, "br_bench", BENCH_STACK_WORDS,
+                                       (void *)&s_sensors, PRIO_PRINT,
+                                       s_bench_stack, &s_bench_tcb, 1)) {
+        ESP_LOGE(TAG, "bench monitor task creation failed -- firings still logged");
+    }
+}
+#endif /* CONFIG_FC_MODE_TEST */
+
 void app_main(void)
 {
+    /* Before the banner, before anything: the PHY has been drawing since
+     * power-on and nothing below needs it. */
+    power_phy_hold_reset();
+
     ESP_LOGI(TAG, "ESP32-P4 flight sensors, interrupt driven");
 
     /* Armed before anything else starts. PRIO_DISCRETE outranks every
@@ -1099,13 +1454,14 @@ void app_main(void)
      * STANDBY: slow rates, gyro powered down, minimal airtime. */
     flight_mode_init();
 
+    /* Right after the mode exists and before anything can change it: the
+     * listener has to be registered before the first possible ARM. */
+    power_pm_init();
+
 #ifdef CONFIG_FC_MODE_TEST
-    ESP_LOGE(TAG, "=====================================================");
-    ESP_LOGE(TAG, "  TEST BUILD -- NOT FOR FLIGHT");
-    ESP_LOGE(TAG, "  Scripted STANDBY/FLIGHT cycle, %d s per step.",
-             CONFIG_FC_TEST_STEP_S);
-    ESP_LOGE(TAG, "  menuconfig -> Flight Computer Operating Mode");
-    ESP_LOGE(TAG, "=====================================================");
+    /* Bench build: the Blue Raven lines and the SD card, nothing else. */
+    blue_raven_bench_test();
+    return;
 #endif
 
 #if !defined(CONFIG_FC_ENABLE_DISCRETE_IN)
@@ -1121,14 +1477,6 @@ void app_main(void)
     ESP_LOGE(TAG, " back on (FC_ENABLE_DISCRETE_IN) before flying.");
     ESP_LOGE(TAG, "=====================================================");
 #else
-    static const discrete_in_config_t discrete_cfgs[2] = {
-        { .input_pin = PIN_STAGING_IN,  .output_pin = PIN_STAGING_OUT,
-          .event = EV_STAGING_SIGNAL,  .channel = 0, .name = "staging",
-          .source = "Blue Raven staging out (tapped from the actuation branch)" },
-        { .input_pin = PIN_RECOVERY_IN, .output_pin = GPIO_NUM_NC,
-          .event = EV_RECOVERY_SIGNAL, .channel = 1, .name = "recovery",
-          .source = "Blue Raven recovery out (tapped from the actuation branch)" },
-    };
     for (int i = 0; i < 2; i++) {
         esp_err_t err = discrete_in_init(&discrete_cfgs[i], &s_sensors.discrete[i]);
         if (err != ESP_OK) {
@@ -1181,22 +1529,44 @@ void app_main(void)
     esp_err_t imu_err  = imu_start(&s_sensors.imu);
     esp_err_t gps_err  = gps_start_sensor(&s_sensors.gps);
 
-    if (baro_err != ESP_OK || imu_err != ESP_OK || gps_err != ESP_OK) {
-        ESP_LOGE(TAG, "One or more sensors failed to start");
-
-        if (baro_err != ESP_OK) {
-            ESP_LOGE(TAG, "barometer failed to start: %s", esp_err_to_name(baro_err));
-            event_log_error(ERR_SRC_BMP388, ERR_CODE_INIT_FAILED, baro_err, 0);
-        }
-        if (imu_err != ESP_OK) {
-            ESP_LOGE(TAG, "IMU failed to start: %s", esp_err_to_name(imu_err));
-            event_log_error(ERR_SRC_LSM6DSOX, ERR_CODE_INIT_FAILED, imu_err, 0);
-        }
-        if (gps_err != ESP_OK) {
-            ESP_LOGE(TAG, "GPS failed to start: %s", esp_err_to_name(gps_err));
-            event_log_error(ERR_SRC_GPS, ERR_CODE_INIT_FAILED, gps_err, 0);
-        }
-        return;
+    /* ---------------------------------------------------------------
+     *  A missing sensor no longer stops the boot.
+     *
+     *  This used to `return` here, before the SD card and the radio were
+     *  started: unplug one sensor and the vehicle went silent, telling the
+     *  ground nothing -- not even which sensor. Now:
+     *
+     *    ESP_ERR_NOT_FOUND  the chip did not answer, but its driver is
+     *                       running in the LOST state and retrying, and
+     *                       re-announces SENSOR_LOST every 5 s, so the
+     *                       ground hears it once the radio is up below
+     *    anything else      the driver itself could not start (no GPIO,
+     *                       no task): the handle stays NULL, everything
+     *                       else runs, and status_task re-announces it
+     *
+     *  Either way the flight logic's failover takes over for that sensor.
+     * --------------------------------------------------------------- */
+    if (baro_err == ESP_ERR_NOT_FOUND) {
+        ESP_LOGE(TAG, "barometer NOT ANSWERING -- running without it, retrying");
+    } else if (baro_err != ESP_OK) {
+        ESP_LOGE(TAG, "barometer driver failed to start: %s -- running without it",
+                 esp_err_to_name(baro_err));
+        event_log_error(ERR_SRC_BMP388, ERR_CODE_INIT_FAILED, baro_err, 0);
+        s_sensors.baro = NULL;
+    }
+    if (imu_err == ESP_ERR_NOT_FOUND) {
+        ESP_LOGE(TAG, "IMU NOT ANSWERING -- running without it, retrying");
+    } else if (imu_err != ESP_OK) {
+        ESP_LOGE(TAG, "IMU driver failed to start: %s -- running without it",
+                 esp_err_to_name(imu_err));
+        event_log_error(ERR_SRC_LSM6DSOX, ERR_CODE_INIT_FAILED, imu_err, 0);
+        s_sensors.imu = NULL;
+    }
+    if (gps_err != ESP_OK) {
+        ESP_LOGE(TAG, "GPS driver failed to start: %s -- running without it",
+                 esp_err_to_name(gps_err));
+        event_log_error(ERR_SRC_GPS, ERR_CODE_INIT_FAILED, gps_err, 0);
+        s_sensors.gps = NULL;
     }
     /*
     
@@ -1302,13 +1672,4 @@ void app_main(void)
         ESP_LOGE(TAG, "print_task creation failed -- continuing without console output");
     }
 
-#ifdef CONFIG_FC_MODE_TEST
-    /* Last, so the first step is timed from "everything is running". */
-    TaskHandle_t test_handle = xTaskCreateStaticPinnedToCore(
-        test_sequence_task, "test_seq", TEST_SEQ_STACK_WORDS, NULL,
-        PRIO_STATUS, s_test_seq_stack, &s_test_seq_tcb, 1);
-    if (!test_handle) {
-        ESP_LOGE(TAG, "test_sequence_task creation failed -- no TEST sequence");
-    }
-#endif
 }

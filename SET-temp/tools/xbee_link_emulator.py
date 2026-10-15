@@ -48,7 +48,22 @@ mesh routing. The 0x8A modem-status frame a real radio emits after reset is
 not sent (the emulator cannot see the /RESET line). --drop gives crude
 random loss for exercising the ground station's lost-packet counting.
 
-API mode 1 only (AP=1, no escaping), which is what the firmware uses.
+API mode 1 (AP=1, no escaping) on both sides by default. With
+--vehicle-transparent the VEHICLE side instead behaves like a module at AP=0,
+for a firmware built with menuconfig -> XBee telemetry link -> Transparent:
+
+  * bytes from the flight computer are sent over the "air" as they arrive,
+    each serial read becoming one RF packet (at most --max-payload bytes) --
+    so a telemetry packet can be split or merged the way a real module's
+    packetisation would, and the ground station has to cope
+  * RF packets for the vehicle come out on its UART as plain payload bytes
+  * +++ after a second of silence enters command mode and answers OK;
+    ATVR, ATDH, ATDL, ATAP, ATCN are answered, so the boot check passes
+
+--ground-transparent does the same for the GROUND side, for a ground station
+run with --transparent (or its "transparent radio" box ticked). The ground
+then sends and receives plain packets over the TCP socket. The two options
+are independent; any of the four combinations works.
 """
 
 import argparse
@@ -218,14 +233,108 @@ class Link:
         return out
 
 
+class TransparentSide:
+    """One radio at AP=0, between its host's serial line and the Link.
+    on_uart(chunk) handles bytes from the host and returns [(side, frame)]
+    for the link's outputs plus raw replies for the host; rx_payload(frame)
+    turns a 0x90 frame for this side into the plain bytes the host sees."""
+
+    GT = 1.0          # guard time, seconds (module default ATGT = 0x3E8 ms)
+    CT = 10.0         # command mode timeout
+
+    def __init__(self, radio, link, clock=time.monotonic, log=None, side="vehicle"):
+        self.side = side
+        self.radio = radio
+        self.link = link
+        self.clock = clock
+        self.log = log or (lambda msg: None)
+        self.last_rx = -1e9
+        self.cmd_mode_until = 0.0
+        self.pending_plus = None    # time a lone +++ arrived, waiting out GT
+        self.line = bytearray()
+        self.dest = BROADCAST
+
+    def in_cmd_mode(self, now):
+        return now < self.cmd_mode_until
+
+    def poll(self):
+        """Call periodically: completes a +++ once GT of silence follows it.
+        Returns bytes to write to the vehicle (b"OK\r") or b""."""
+        now = self.clock()
+        if self.pending_plus is not None and now - self.pending_plus >= self.GT:
+            self.pending_plus = None
+            self.cmd_mode_until = now + self.CT
+            self.line.clear()
+            self.log(f"{self.side}: command mode (+++)")
+            return b"OK\r"
+        return b""
+
+    def _answer(self, cmd):
+        r = self.radio
+        if cmd == "ATCN":
+            self.cmd_mode_until = 0.0
+            self.log(f"{self.side}: left command mode (ATCN)")
+            return b"OK\r"
+        if cmd == "ATVR":
+            return b"%X\r" % int.from_bytes(r.at["VR"], "big")
+        if cmd == "ATDH":
+            return b"%X\r" % (self.dest >> 32)
+        if cmd == "ATDL":
+            return b"%X\r" % (self.dest & 0xFFFFFFFF)
+        if cmd == "ATAP":
+            return b"0\r"
+        if cmd in ("AT", "ATWR", "ATAC"):
+            return b"OK\r"
+        return b"ERROR\r"
+
+    def on_uart(self, chunk):
+        """-> (link_outputs, bytes_for_vehicle)"""
+        now = self.clock()
+        silent = now - self.last_rx
+        self.last_rx = now
+        if self.pending_plus is not None:
+            self.pending_plus = None                 # +++ not followed by silence: data
+        if self.in_cmd_mode(now):
+            self.cmd_mode_until = now + self.CT
+            reply = b""
+            for b in chunk:
+                if b == 0x0D:
+                    reply += self._answer(self.line.decode("ascii", "replace").strip().upper())
+                    self.line.clear()
+                else:
+                    self.line.append(b)
+            return [], reply
+        if chunk == b"+++" and silent >= self.GT:
+            self.pending_plus = now
+            return [], b""
+        outs = []
+        for i in range(0, len(chunk), self.radio.max_payload):
+            rf = chunk[i:i + self.radio.max_payload]
+            frame = (bytes([0x10, 0x00]) + self.dest.to_bytes(8, "big")
+                     + b"\xFF\xFE\x00\x00" + rf)
+            outs += self.link.from_host(self.side, frame)
+        return outs, b""
+
+    @staticmethod
+    def rx_payload(frame):
+        """A 0x90 API frame (with 7E/len/checksum) -> its RF payload."""
+        return frame[3 + 12:-1]
+
+
 # --------------------------------------------------------------------------
 # I/O: vehicle on a serial port, ground on a TCP socket
 # --------------------------------------------------------------------------
 
 class Emulator:
     def __init__(self, link: Link, vehicle_port, listen_host="127.0.0.1",
-                 listen_port=9750, capture_path=None, log=None, junk_log_limit=10):
+                 listen_port=9750, capture_path=None, log=None, junk_log_limit=10,
+                 vehicle_transparent=False, ground_transparent=False):
         self.link = link
+        self.transparent = (TransparentSide(link.radios["vehicle"], link, log=log)
+                            if vehicle_transparent else None)
+        self.ground_transparent = (TransparentSide(link.radios["ground"], link, log=log,
+                                                   side="ground")
+                                   if ground_transparent else None)
         self.vehicle = vehicle_port
         self.log = log or (lambda msg: None)
         self.lock = threading.Lock()
@@ -245,8 +354,16 @@ class Emulator:
     # -- output --
     def _send(self, side, frame):
         if side == "vehicle":
+            if self.transparent is not None:
+                if frame[3] != 0x90:                  # no API frames at AP=0
+                    return
+                frame = TransparentSide.rx_payload(frame)
             self.vehicle.write(frame)
             return
+        if self.ground_transparent is not None:
+            if frame[3] != 0x90:                      # no API frames at AP=0
+                return
+            frame = TransparentSide.rx_payload(frame)
         if self.capture:
             self.capture.write(frame)
             self.capture.flush()
@@ -262,6 +379,23 @@ class Emulator:
     # -- input --
     def on_bytes(self, side, chunk):
         with self.lock:
+            if side == "vehicle" and self.transparent is not None:
+                outs, reply = self.transparent.on_uart(chunk)
+                for dst, frame in outs:
+                    self._send(dst, frame)
+                if reply:
+                    self.vehicle.write(reply)
+                return
+            if side == "ground" and self.ground_transparent is not None:
+                outs, reply = self.ground_transparent.on_uart(chunk)
+                for dst, frame in outs:
+                    self._send(dst, frame)
+                if reply and self.client is not None:
+                    try:
+                        self.client.sendall(reply)
+                    except OSError:
+                        pass
+                return
             for kind, payload in self.parsers[side].feed(chunk):
                 if kind == "frame":
                     for dst, frame in self.link.from_host(side, payload):
@@ -279,6 +413,11 @@ class Emulator:
 
     def _vehicle_reader(self):
         while self.running:
+            if self.transparent is not None:
+                with self.lock:
+                    reply = self.transparent.poll()
+                if reply:
+                    self.vehicle.write(reply)
             try:
                 chunk = self.vehicle.read(max(1, self.vehicle.in_waiting))
             except Exception as e:                   # port unplugged, etc.
@@ -290,6 +429,14 @@ class Emulator:
 
     def _accept_loop(self):
         while self.running:
+            if self.ground_transparent is not None:
+                with self.lock:
+                    reply = self.ground_transparent.poll()
+                if reply and self.client is not None:
+                    try:
+                        self.client.sendall(reply)
+                    except OSError:
+                        pass
             try:
                 conn, addr = self.server.accept()
             except socket.timeout:
@@ -384,6 +531,10 @@ def main(argv=None):
     ap.add_argument("--seed", type=int, help="random seed for --drop")
     ap.add_argument("--capture", help="append every byte the ground radio outputs to this file")
     ap.add_argument("--status-interval", type=float, default=5.0)
+    ap.add_argument("--vehicle-transparent", action="store_true",
+                    help="vehicle radio at AP=0 (firmware built for XBee transparent mode)")
+    ap.add_argument("--ground-transparent", action="store_true",
+                    help="ground radio at AP=0 (ground_station.py --transparent)")
     args = ap.parse_args(argv)
 
     def log(msg):
@@ -396,10 +547,15 @@ def main(argv=None):
     link = Link(vehicle, ground, args.drop, args.retries, random.Random(args.seed), log)
 
     ser = serial.serial_for_url(args.vehicle_port, baudrate=args.baud, timeout=0.1)
-    emu = Emulator(link, ser, host or "127.0.0.1", int(port), args.capture, log)
+    emu = Emulator(link, ser, host or "127.0.0.1", int(port), args.capture, log,
+                   vehicle_transparent=args.vehicle_transparent,
+                   ground_transparent=args.ground_transparent)
     emu.start()
     log(f"vehicle on {args.vehicle_port} @ {args.baud}; ground tools connect to "
         f"socket://{host or '127.0.0.1'}:{emu.listen_port}")
+    log("vehicle radio: %s, ground radio: %s" % (
+        "TRANSPARENT (AP=0)" if args.vehicle_transparent else "API (AP=1)",
+        "TRANSPARENT (AP=0)" if args.ground_transparent else "API (AP=1)"))
     log("reset the flight computer now so its ATVR probe is answered")
     try:
         while emu.running:
