@@ -1,0 +1,78 @@
+SET I Osiris flight computer -- configuration snapshot
+written at unmount (uplink command), uptime 778 s, mode STANDBY
+
+Values are as they stood at unmount, not as init was called: a
+field changed at runtime reads changed here. Sample rates are
+not in this file because they are not config -- they follow the
+flight mode. See the rate table in the design record.
+
+bmp388
+  int_pin            6
+  osr_pressure       0x03   (BMP3_OVERSAMPLING_*, as configured at init)
+  osr_temp           0x01
+  odr                0x03   (BMP3_ODR_*, overridden by flight mode)
+  iir_filter         0x02
+  ref_pressure_pa    100074.78   (pad reference, set at runtime)
+
+lsm6dsox
+  int_pin              16   (INT1, data ready)
+  int2_pin             15   (INT2, wake-up; -1 disables liftoff detect)
+  liftoff_threshold_g  3.00
+  liftoff_dur_samples  2
+  accel/gyro ranges    +/-16 g, +/-2000 dps (hardcoded, not configurable)
+
+gps (PA1616D)
+  uart_port            1   (its own UART, separate from the XBee)
+  tx_pin               27
+  rx_pin               32
+  pps_pin              26
+  en_pin               33   (-1 = left floating on the module pull-up)
+
+battery
+  adc_channel          4
+  divider_ratio        0.2842
+  sample_rate_hz       10   (flight rate; standby is 1 Hz)
+  oversample           16
+  warn_volts           7.20   (logged only, never changes behaviour; 0 = off)
+  critical_volts       6.60
+
+telemetry (XBee)
+  uart_port            2
+  tx_pin               3   (-> module DIN)
+  rx_pin               4   (<- module DOUT)
+  rst_pin              2   (-1 = /RESET not wired)
+  baud_rate            115200
+  dest_addr            000000000000FFFF   [broadcast: no per-packet delivery ack]
+  imu_decimation       4   (1 in N IMU records downlinked in flight)
+  radio_verified       yes   (an ATVR round-tripped at boot)
+
+sd_logger
+  mount_point          /sdcard
+  ldo_chan_id          4   (ESP32-P4 SDMMC IO rail)
+  max_freq_khz         0   [default: SDMMC_FREQ_DEFAULT, 20 MHz]
+  format_if_mount_failed false
+  buf_size             512 bytes per stream
+  flush_ms             1000
+
+discrete_in [staging]
+  input_pin            22
+  output_pin           -1   (-1 = nothing driven in response)
+  event                3   (event_type_t recorded on an edge)
+  channel              0
+  source               Blue Raven staging out (tapped from the actuation branch)
+discrete_in [recovery]
+  input_pin            23
+  output_pin           -1   (-1 = nothing driven in response)
+  event                4   (event_type_t recorded on an edge)
+  channel              1
+  source               Blue Raven recovery out (tapped from the actuation branch)
+
+deployment channels (from NVS flight_cfg/config_json)
+  Apo   latch=false delay_ms=1500  manual_arm=false
+        primary  : AGL1(0.00) AGL2(0.00) FANG1(0.00)
+        secondary: (empty -- can never be satisfied)
+  Main  latch=false delay_ms=1500  manual_arm=false
+        primary  : (empty -- can never be satisfied)
+        secondary: (empty -- can never be satisfied)
+  3rd   latch=false de
+*** TRUNCATED -- raise CFG_TEXT_MAX ***

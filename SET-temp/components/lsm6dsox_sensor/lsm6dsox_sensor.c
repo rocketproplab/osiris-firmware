@@ -26,6 +26,7 @@ static const char *TAG = "LSM6DSOX";
 #define LSM6DSOX_CTRL9_XL       0x18    // Control register 9 (I3C disable)
 #define LSM6DSOX_CTRL9_I3C_DISABLE 0x02 // bit 1. Bit 0 is not-used and must stay 0.
 #define LSM6DSOX_INT1_CTRL      0x0D    // Routes DRDY_XL / DRDY_G to INT1
+#define LSM6DSOX_STATUS_REG     0x1E    // XLDA bit 0, GDA bit 1, TDA bit 2
 #define LSM6DSOX_OUTX_L_G       0x22    // Gyro output start
 #define LSM6DSOX_OUTX_L_A       0x28    // Accel output start
 
@@ -102,6 +103,7 @@ struct lsm6dsox_dev {
 
     /* INT2 / wake-up. Written only by the INT2 ISR, read by anyone. */
     bool                fast;      /* current rate configuration */
+    uint8_t             gyro_check_left;  /* samples to dump after the gyro powers up */
     volatile bool       liftoff_detected;
     volatile uint64_t   liftoff_timestamp_us;
     volatile uint32_t   liftoff_count;
@@ -334,6 +336,21 @@ static void lsm6dsox_task(void *arg)
         if ((all00 || allFF) && !lsm6dsox_probe(dev, NULL)) {
             sensor_health_lost(&dev->health, SENSOR_LOST_NO_RESPONSE, now_us);
             continue;
+        }
+
+        /* The first few samples after the gyro is powered up (STANDBY ->
+         * ARMED/FLIGHT), printed raw with the chip's own data-ready flags.
+         * GDA=1 with non-zero bytes: the gyro is converting. GDA=0 or every
+         * byte 0x00: it is not, whatever CTRL2_G says. */
+        if (dev->gyro_check_left) {
+            uint8_t st = 0;
+            (void)lsm6dsox_read_regs(dev, LSM6DSOX_STATUS_REG, &st, 1);
+            ESP_LOGW(TAG, "gyro check %u/3: raw %02X %02X %02X %02X %02X %02X  "
+                          "STATUS 0x%02X (GDA=%d XLDA=%d)  fast=%d",
+                     (unsigned)(4 - dev->gyro_check_left),
+                     gyro_raw[0], gyro_raw[1], gyro_raw[2], gyro_raw[3],
+                     gyro_raw[4], gyro_raw[5], st, (st >> 1) & 1, st & 1, (int)dev->fast);
+            dev->gyro_check_left--;
         }
 
         int16_t gx = (int16_t)((gyro_raw[1] << 8) | gyro_raw[0]);
@@ -880,10 +897,29 @@ esp_err_t lsm6dsox_set_rate(lsm6dsox_handle_t dev, bool fast)
     }
 
     dev->fast = fast;
-    ESP_LOGW(TAG, "rate -> %s (accel %s, gyro %s)",
+
+    /* Read both rate registers back. A write the chip silently ignored
+     * would otherwise look exactly like success: the accelerometer would
+     * change rate and the gyro would not, or the other way round. */
+    uint8_t xl = 0xFF, g = 0xFF;
+    esp_err_t rb = lsm6dsox_read_regs(dev, LSM6DSOX_CTRL1_XL, &xl, 1);
+    if (rb == ESP_OK) {
+        rb = lsm6dsox_read_regs(dev, LSM6DSOX_CTRL2_G, &g, 1);
+    }
+    const uint8_t want_xl = fast ? LSM6DSOX_CTRL1_XL_VAL : LSM6DSOX_CTRL1_XL_SLOW;
+    const uint8_t want_g  = fast ? LSM6DSOX_CTRL2_G_VAL  : LSM6DSOX_CTRL2_G_SLOW;
+    ESP_LOGW(TAG, "rate -> %s (accel %s, gyro %s)  read back CTRL1_XL=0x%02X CTRL2_G=0x%02X",
              fast ? "FLIGHT" : "STANDBY",
              fast ? "104 Hz" : "12.5 Hz",
-             fast ? "104 Hz" : "POWERED DOWN");
+             fast ? "104 Hz" : "POWERED DOWN", xl, g);
+    if (rb != ESP_OK || xl != want_xl || g != want_g) {
+        ESP_LOGE(TAG, "rate registers did NOT take: wanted CTRL1_XL=0x%02X CTRL2_G=0x%02X, "
+                      "chip says 0x%02X 0x%02X (%s)", want_xl, want_g, xl, g,
+                 esp_err_to_name(rb));
+        event_log_error(ERR_SRC_LSM6DSOX, ERR_CODE_CONFIG_INVALID, ESP_ERR_INVALID_STATE,
+                        ((uint32_t)xl << 8) | g);
+    }
+    dev->gyro_check_left = fast ? 3 : 0;
     return ESP_OK;
 }
 

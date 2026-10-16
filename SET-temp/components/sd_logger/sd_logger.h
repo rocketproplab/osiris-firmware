@@ -53,6 +53,21 @@
 #define SD_LOGGER_FLUSH_MS        1000
 #endif
 
+/* Commit file sizes to the card (fsync) at every periodic flush, so a
+ * card pulled without an eject keeps everything but the last interval.
+ * A Kconfig bool is simply absent when off, so "is there a Kconfig build
+ * at all" is told apart by CONFIG_SD_LOGGER_FLUSH_MS, which always
+ * exists in one. With no sdkconfig.h (host tests) it defaults on. */
+#if defined(CONFIG_SD_LOGGER_FLUSH_MS)
+#  ifdef CONFIG_SD_LOGGER_SYNC
+#    define SD_LOGGER_SYNC        1
+#  else
+#    define SD_LOGGER_SYNC        0
+#  endif
+#else
+#  define SD_LOGGER_SYNC          1
+#endif
+
 /* Per-stream queue depths, derived from each sensor's own real rate --
  * not one shared depth for all three anymore. Previously one shared
  * ring buffer meant a burst from a fast sensor (IMU, 104 Hz) could
@@ -164,8 +179,9 @@ typedef struct {
     uint32_t records_written;   // actually made it into a file buffer
     uint32_t queue_full_drops;  // an unwritten record was overwritten by a
                                  // newer one because the card couldn't keep up
-    uint32_t write_errors;      // fwrite/fflush failures
-    uint32_t flushes;           // buffer -> card operations
+    uint32_t write_errors;      // fwrite/fflush/fsync failures
+    uint32_t flushes;           // buffer -> FATFS operations
+    uint32_t syncs;             // fsync()s: a file's size committed on the card
 } sd_logger_diag_t;
 
 /* ===================================================================
@@ -190,8 +206,14 @@ esp_err_t sd_logger_init(const sd_logger_config_t *cfg, sd_logger_handle_t *out)
 esp_err_t sd_logger_start(sd_logger_handle_t dev, UBaseType_t priority, BaseType_t core_id);
 
 /* Flushes everything still buffered, closes the files, unmounts the
- * card, kills the task, releases the pool slot. Call this before power
- * down or you WILL lose the tail of the flight. */
+ * card, kills the task, releases the pool slot.
+ *
+ * With SD_LOGGER_SYNC on (the default), skipping this -- pulling the
+ * card, or losing power -- costs at most the last SD_LOGGER_FLUSH_MS of
+ * data. Still call it when you can: it is the only way to be sure no
+ * write is in progress at the instant the card comes out. With
+ * SD_LOGGER_SYNC off, skipping it loses EVERY file's contents, because
+ * nothing else writes their sizes to the card. */
 esp_err_t sd_logger_stop(sd_logger_handle_t dev);
 
 /* ===================================================================
@@ -207,8 +229,13 @@ esp_err_t sd_logger_stop(sd_logger_handle_t dev);
 esp_err_t sd_logger_write(sd_logger_handle_t dev, sensor_stream_t stream,
                           const void *record, size_t len);
 
-/* Force every stream's buffer out to the card right now. Blocks until
- * done. Use before a known risky moment (e.g. just before deployment). */
+/* Force every stream's buffer out to the card right now, sizes included
+ * (when SD_LOGGER_SYNC is on). Blocks until done. Use before a known
+ * risky moment. Not needed for flight events: the writer task already
+ * commits the moment an event record is drained.
+ *
+ * Touches the same FILE*s as the writer task without a lock, so do not
+ * call it while that task is running. Nothing currently does. */
 esp_err_t sd_logger_flush(sd_logger_handle_t dev);
 
 void sd_logger_get_diagnostics(sd_logger_handle_t dev, sd_logger_diag_t *out);

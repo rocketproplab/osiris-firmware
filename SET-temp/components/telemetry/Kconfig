@@ -41,6 +41,24 @@ menu "XBee telemetry link"
                 leave RO (packetization timeout) at its default.
     endchoice
 
+    config TELEMETRY_XBEE_RETRY_MS
+        int "Keep retrying an unverified radio every N ms (0 = off)"
+        range 0 60000
+        default 2000
+        help
+            If the boot check could not verify the radio, the telemetry
+            task keeps trying in the background: it sends the bootloader
+            escape (in case the module is sitting in its bootloader), waits
+            for it to start, then asks again -- ATVR in API mode, +++ /
+            ATVR / ATCN in transparent mode. It stops the moment the radio
+            answers, and STATUS_FLAG_TELEM_OK comes on.
+
+            Only in STANDBY. Never once the vehicle is ARMED or flying: in
+            transparent mode each try puts a few stray bytes on the air and
+            pauses the downlink for about 2.5 s while in command mode.
+
+            Transparent builds retry only if the +++ boot check is enabled.
+
     config TELEMETRY_XBEE_TRANSPARENT_VERIFY
         bool "Check the radio at boot with +++ / ATVR"
         depends on TELEMETRY_XBEE_TRANSPARENT

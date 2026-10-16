@@ -37,6 +37,19 @@ static const char *TAG = "TELEMETRY";
 #define XBEE_TRANSPARENT_VERIFY 0
 #endif
 
+/* Background retry of an unverified radio, in STANDBY only. 0 = off.
+ * Transparent builds can only ask through +++, so they retry only when
+ * that check is compiled in. */
+#if defined(CONFIG_TELEMETRY_XBEE_RETRY_MS)
+#define XBEE_RETRY_MS CONFIG_TELEMETRY_XBEE_RETRY_MS
+#else
+#define XBEE_RETRY_MS 2000
+#endif
+#if XBEE_TRANSPARENT && !XBEE_TRANSPARENT_VERIFY
+#undef  XBEE_RETRY_MS
+#define XBEE_RETRY_MS 0
+#endif
+
 /* Silence either side of +++. Must exceed the module's GT (1000 ms by
  * default). Also used by an API build that suspects its module is
  * really in transparent mode. */
@@ -86,6 +99,10 @@ struct telemetry_dev {
 #if XBEE_TRANSPARENT
     uplink_stream_t      ustream;     /* uplink packets out of raw DOUT bytes */
 #endif
+    /* Background retry state (XBEE_RETRY_MS). */
+    uint64_t             retry_next_us;     /* next escape is due */
+    uint64_t             retry_probe_us;    /* API: ATVR due (escape settle), 0 = none */
+    uint8_t              retry_fid;         /* API: frame id of the pending ATVR */
 
     /* Uplink command state. last_cmd_seq starts at 0 and no command may
      * use seq 0, so the very first real command is always newer. */
@@ -367,6 +384,19 @@ static void telemetry_handle_at_response(struct telemetry_dev *dev,
         dev->diag.last_rssi = value[0];
         portEXIT_CRITICAL(&dev->diag_lock);
     }
+    /* The answer to a background retry's ATVR: the radio is back. */
+    if (c0 == 'V' && c1 == 'R' && status == 0 && dev->retry_fid != 0 &&
+        fid == dev->retry_fid) {
+        uint32_t v = 0;
+        for (uint16_t k = 0; k < value_len && k < 4; k++) { v = (v << 8) | value[k]; }
+        dev->retry_fid = 0;
+        portENTER_CRITICAL(&dev->diag_lock);
+        dev->diag.radio_verified = true;
+        uint32_t tries = dev->diag.verify_retries;
+        portEXIT_CRITICAL(&dev->diag_lock);
+        ESP_LOGW(TAG, "radio verified on background retry %u: ATVR = 0x%04X",
+                 (unsigned)tries, (unsigned)v);
+    }
 }
 #endif /* !XBEE_TRANSPARENT */
 
@@ -634,6 +664,80 @@ static bool telemetry_stage_record(struct telemetry_dev *dev, const queue_item_t
     return true;
 }
 
+#if XBEE_RETRY_MS > 0
+#if XBEE_TRANSPARENT
+static bool xbee_transparent_probe(struct telemetry_dev *dev, uint32_t *version,
+                                   uint64_t *dest);
+#endif
+
+/* The boot check failed. Keep knocking, in STANDBY only, until the radio
+ * answers: bootloader escape first (a module stuck in its bootloader
+ * answers nothing else), then the normal question for this mode.
+ *
+ * API: non-blocking. The escape goes out now, the ATVR one settle time
+ * later, and the answer is caught by telemetry_handle_at_response() like
+ * any other AT response.
+ * Transparent: +++ needs a guard time of silence either side, so the
+ * probe blocks this task for about 2.5 s -- acceptable on the pad, which
+ * is why this never runs outside STANDBY. */
+static void telemetry_retry_radio(struct telemetry_dev *dev, uint64_t now)
+{
+    bool verified;
+    portENTER_CRITICAL(&dev->diag_lock);
+    verified = dev->diag.radio_verified;
+    portEXIT_CRITICAL(&dev->diag_lock);
+    if (verified || flight_mode_get() != MODE_STANDBY) {
+        dev->retry_probe_us = 0;
+        return;
+    }
+
+#if !XBEE_TRANSPARENT
+    if (dev->retry_probe_us != 0 && now >= dev->retry_probe_us) {
+        uint8_t f[16];
+        dev->retry_fid = next_frame_id(dev);
+        size_t n = xbee_build_at_query(dev->retry_fid, 'V', 'R', f, sizeof f);
+        if (n) { uart_write_bytes(dev->cfg.uart_port, (const char *)f, n); }
+        dev->retry_probe_us = 0;
+    }
+#endif
+    if (now < dev->retry_next_us) {
+        return;
+    }
+    dev->retry_next_us = now + (uint64_t)XBEE_RETRY_MS * 1000ULL;
+
+    static const char escape[] = XBEE_ESCAPE_BYTES;
+    uart_write_bytes(dev->cfg.uart_port, escape, sizeof(escape) - 1);
+    uint32_t tries;
+    portENTER_CRITICAL(&dev->diag_lock);
+    dev->diag.bootloader_escapes++;
+    tries = ++dev->diag.verify_retries;
+    portEXIT_CRITICAL(&dev->diag_lock);
+    if (tries == 1 || tries % 10 == 0) {
+        ESP_LOGW(TAG, "radio still not verified -- retry %u: bootloader escape, then "
+                      "%s (every %d ms while in STANDBY)", (unsigned)tries,
+                 XBEE_TRANSPARENT ? "+++ / ATVR" : "ATVR", XBEE_RETRY_MS);
+    }
+
+#if XBEE_TRANSPARENT
+    vTaskDelay(pdMS_TO_TICKS(XBEE_ESCAPE_SETTLE_MS));
+    uint32_t v = 0;
+    uint64_t dest = 0;
+    if (xbee_transparent_probe(dev, &v, &dest)) {
+        portENTER_CRITICAL(&dev->diag_lock);
+        dev->diag.radio_verified = true;
+        portEXIT_CRITICAL(&dev->diag_lock);
+        ESP_LOGW(TAG, "radio verified on background retry %u (transparent): ATVR = 0x%04X, "
+                      "DH:DL = %016llX", (unsigned)tries, (unsigned)v,
+                 (unsigned long long)dest);
+    }
+    /* The probe blocked for seconds; space the next try from now. */
+    dev->retry_next_us = (uint64_t)esp_timer_get_time() + (uint64_t)XBEE_RETRY_MS * 1000ULL;
+#else
+    dev->retry_probe_us = now + (uint64_t)XBEE_ESCAPE_SETTLE_MS * 1000ULL;
+#endif
+}
+#endif /* XBEE_RETRY_MS */
+
 /* One pass of the telemetry task: uplink in, records staged, block
  * flushed on timeout, RSSI polled. Returns true if any record was
  * staged. Split out of the task so the host test can drive it. */
@@ -674,6 +778,9 @@ static bool telemetry_service(struct telemetry_dev *dev)
         }
         dev->last_rssi_poll_us = now;
     }
+#endif
+#if XBEE_RETRY_MS > 0
+    telemetry_retry_radio(dev, now);
 #endif
     return got_one;
 }

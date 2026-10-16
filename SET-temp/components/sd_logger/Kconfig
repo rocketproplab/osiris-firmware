@@ -68,6 +68,32 @@ config SD_LOGGER_FLUSH_MS
         Lower means less data at risk on a sudden power loss, at the
         cost of more frequent (and more wearing) card writes.
 
+config SD_LOGGER_SYNC
+    bool "Commit file sizes to the card at every flush (survive a card pull)"
+    default y
+    help
+        FAT keeps each file's size in its directory entry, and only
+        fsync() or fclose() rewrites that entry. Without this, every
+        file's size on the card stays at what it was when it was opened
+        -- zero -- until the card is ejected. Pull the card or lose power
+        without an eject and the PC sees empty files: the data is on the
+        card, but nothing points at it.
+
+        With this on, every SD_LOGGER_FLUSH_MS the writer task fsync()s
+        each file that got new data, and also does so immediately
+        whenever a flight event (ARM, liftoff, apogee, deployment...) is
+        logged. Worst case on an un-ejected pull: the last flush
+        interval is lost.
+
+        Cost: about two small sector writes per changed file per
+        interval, on the writer task only (sensor tasks never wait on
+        the card). Turn off only if queue_full_drops climbs on a slow
+        card and you have confirmed this is why.
+
+        ESP-IDF also has FATFS_IMMEDIATE_FSYNC (FAT Filesystem support),
+        which syncs after EVERY write call. That is the same protection
+        at a few times the card writes; leave it off and use this.
+
 config SD_LOGGER_STACK_WORDS
     int "Writer task stack (words, not bytes)"
     range 2048 8192

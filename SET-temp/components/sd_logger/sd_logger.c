@@ -2,6 +2,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <unistd.h>     /* fsync() -- see sd_sync_stream() */
 
 #include "ring_buffer.h"
 #include "event_log.h"
@@ -59,6 +60,8 @@ typedef struct {
     size_t   buf_used;
     uint8_t  record_size;
     const char *filename;
+    bool     dirty;      /* bytes reached FATFS since this file's last
+                          * fsync(), so its size on the card is stale */
 } sd_stream_state_t;
 
 /* ===================================================================
@@ -206,11 +209,13 @@ static esp_err_t sd_flush_stream(sd_logger_handle_t dev, sd_stream_state_t *st)
         dev->diag.write_errors++;
         event_log_error(ERR_SRC_SD, ERR_CODE_WRITE_FAILED, ESP_FAIL, dev->diag.write_errors);
         st->buf_used = 0;   /* drop it rather than retry forever */
+        st->dirty = true;   /* a short write may still have moved bytes */
         return ESP_FAIL;
     }
+    st->dirty = true;
 
-    /* fflush pushes the C library's own buffer into FATFS. Without it,
-     * a power cut can lose data that fwrite() already "accepted". */
+    /* fflush pushes the C library's own buffer into FATFS. That is NOT
+     * the same as being safe on the card -- see sd_sync_stream(). */
     if (fflush(st->fp) != 0) {
         ESP_LOGE(TAG, "fflush failed");
         dev->diag.write_errors++;
@@ -256,6 +261,67 @@ static void sd_append_record(sd_logger_handle_t dev, sd_stream_state_t *st,
 }
 
 /* ===================================================================
+ *  Committing to the card -- why fflush() is not enough
+ *
+ *  FAT records a file's SIZE in one place: its directory entry. fflush()
+ *  hands bytes to FATFS, and FATFS writes them into clusters on the
+ *  card, but it leaves the directory entry alone. So until something
+ *  rewrites that entry, a PC reading the card believes the file is
+ *  exactly as long as it was the last time it was rewritten -- which,
+ *  for a file opened "wb" at boot, is zero bytes. The data is physically
+ *  on the card; nothing says it is there.
+ *
+ *  That is why pulling the card without an eject lost EVERYTHING rather
+ *  than the last few seconds: fclose() at unmount was the only thing
+ *  that ever wrote the size.
+ *
+ *  fsync() is FATFS's f_sync(): it writes the file's cached sector, the
+ *  FAT chain, and the directory entry with the new size -- everything
+ *  fclose() does, minus the close. After it, whatever has been written
+ *  so far survives a card pull, a dead battery, or a brownout.
+ * =================================================================== */
+
+/* Returns without touching the card if nothing changed since the last
+ * sync. On failure the stream stays dirty, so the next commit retries. */
+static void sd_sync_stream(sd_logger_handle_t dev, sd_stream_state_t *st)
+{
+    if (!st->dirty || !st->fp) {
+        return;
+    }
+    if (fsync(fileno(st->fp)) != 0) {
+        ESP_LOGE(TAG, "fsync %s failed", st->filename);
+        dev->diag.write_errors++;
+        event_log_error(ERR_SRC_SD, ERR_CODE_WRITE_FAILED, ESP_FAIL, dev->diag.write_errors);
+        return;
+    }
+    st->dirty = false;
+    dev->diag.syncs++;
+}
+
+/* Flush every buffer to FATFS, then (unless SD_LOGGER_SYNC is off in
+ * menuconfig) commit every file that changed.
+ *
+ * Only changed files are synced. err.bin and event.bin sit untouched
+ * for most of a flight, and rewriting their directory entries every
+ * second anyway would be card writes that record nothing.
+ *
+ * A plain `if`, not #if: with the option off, sd_sync_stream() is still
+ * referenced, so an ESP-IDF build (which promotes -Wall warnings to
+ * errors) does not fail on an unused static function. The compiler
+ * drops the dead loop either way. */
+static void sd_commit_all(sd_logger_handle_t dev)
+{
+    for (int i = 0; i < STREAM_COUNT; i++) {
+        sd_flush_stream(dev, &dev->streams[i]);
+    }
+    if (SD_LOGGER_SYNC) {
+        for (int i = 0; i < STREAM_COUNT; i++) {
+            sd_sync_stream(dev, &dev->streams[i]);
+        }
+    }
+}
+
+/* ===================================================================
  *  Writer task
  *
  *  This is the whole reason the ring buffer exists. SD cards stall -- a
@@ -294,6 +360,36 @@ static bool sd_drain_one_rb(sd_logger_handle_t dev, sensor_stream_t stream,
     return got_one;
 }
 
+/* One pass over every stream's buffer. Returns true if anything was
+ * drained, so the caller can tell "idle" from "just finished a batch".
+ *
+ * If an EVENT record went by, everything is committed right away rather
+ * than at the next periodic flush. Events are the flight's timeline --
+ * ARM, liftoff, burn end, apogee, a deployment, a sensor dropping out --
+ * which are both the moments a flight review needs and the moments a
+ * vehicle is most likely to lose power or hit something. They are also
+ * rare (a few dozen per flight), so this adds a few dozen syncs, not a
+ * rate. The other streams are drained before the commit, so the sensor
+ * data leading up to the event is committed with it. */
+static bool sd_writer_drain(sd_logger_handle_t dev)
+{
+    bool got_any   = false;
+    bool got_event = false;
+    for (int i = 0; i < STREAM_COUNT; i++) {
+        ring_buffer_t *rb = rb_by_index(dev, i);
+        if (rb && sd_drain_one_rb(dev, (sensor_stream_t)i, rb)) {
+            got_any = true;
+            if (i == STREAM_EVENT) {
+                got_event = true;
+            }
+        }
+    }
+    if (got_event) {
+        sd_commit_all(dev);
+    }
+    return got_any;
+}
+
 static void sd_logger_task(void *arg)
 {
     /* Last drop count reported, so each pass reports only what is new.
@@ -313,13 +409,7 @@ static void sd_logger_task(void *arg)
          * is genuinely empty. Same trade-off as before regarding the
          * 10ms poll vs. a true blocking wait -- see the note this
          * comment used to carry, unchanged by the three-buffer split. */
-        bool got_one = false;
-        for (int i = 0; i < STREAM_COUNT; i++) {
-            ring_buffer_t *rb = rb_by_index(dev, i);
-            if (rb) {
-                got_one |= sd_drain_one_rb(dev, (sensor_stream_t)i, rb);
-            }
-        }
+        bool got_one = sd_writer_drain(dev);
 
         if (!got_one) {
             vTaskDelay(pdMS_TO_TICKS(10));
@@ -335,11 +425,12 @@ static void sd_logger_task(void *arg)
         }
 
         /* Periodic flush: a 1 Hz GPS stream would otherwise sit in RAM
-         * for ~15 minutes before its 512-byte buffer filled. */
+         * for ~15 minutes before its 512-byte buffer filled. Followed
+         * by a sync of every changed file, so a card pulled or a
+         * battery lost without an eject costs at most this interval
+         * rather than the whole flight -- see sd_sync_stream(). */
         if ((xTaskGetTickCount() - last_flush) >= flush_interval) {
-            for (int i = 0; i < STREAM_COUNT; i++) {
-                sd_flush_stream(dev, &dev->streams[i]);
-            }
+            sd_commit_all(dev);
             last_flush = xTaskGetTickCount();
         }
     }
@@ -446,6 +537,7 @@ static esp_err_t sd_open_files(sd_logger_handle_t dev)
             return ESP_FAIL;
         }
         fflush(st->fp);
+        st->dirty = true;   /* first commit makes the headered file visible */
 
         ESP_LOGI(TAG, "opened %s (record size %u B)", path, st->record_size);
     }
@@ -718,6 +810,17 @@ esp_err_t sd_logger_flush(sd_logger_handle_t dev)
     esp_err_t result = ESP_OK;
     for (int i = 0; i < STREAM_COUNT; i++) {
         if (sd_flush_stream(dev, &dev->streams[i]) != ESP_OK) {
+            result = ESP_FAIL;
+        }
+    }
+    /* "Out to the card" has to include the directory entry, or the
+     * bytes are on the card with nothing pointing at them. */
+    if (SD_LOGGER_SYNC) {
+        uint32_t errs_before = dev->diag.write_errors;
+        for (int i = 0; i < STREAM_COUNT; i++) {
+            sd_sync_stream(dev, &dev->streams[i]);
+        }
+        if (dev->diag.write_errors != errs_before) {
             result = ESP_FAIL;
         }
     }

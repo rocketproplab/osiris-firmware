@@ -1,0 +1,3 @@
+seq,timestamp_us,type,channel,flags,detail
+1,11079288,BOOT,0,0,0
+2,11084484,SD_MOUNTED,0,0,0

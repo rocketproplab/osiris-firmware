@@ -244,6 +244,8 @@ typedef struct {
     bool     transparent;               // built for transparent mode (AP=0)
     bool     wrong_mode_detected;       // the module answered in the OTHER mode
                                         // than this build expects -- see the log
+    uint32_t verify_retries;            // background escape+probe attempts after a
+                                        // failed boot check (TELEMETRY_XBEE_RETRY_MS)
     uint32_t uplink_discarded_bytes;    // transparent only: DOUT bytes that were
                                         // not part of a valid uplink packet
 } telemetry_diag_t;
